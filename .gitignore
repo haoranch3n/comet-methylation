@@ -1,0 +1,24 @@
+# Pipeline outputs
+output/
+
+# renv local package library (restore with renv::restore())
+renv/library/
+renv/python/
+renv/cellar/
+renv/local/
+renv/staging/
+renv/lock/
+
+# HPC / install logs
+*.out
+*.err
+
+# Large proprietary / reference tarball (obtain separately; exceeds GitHub file size limit)
+yamapData*.tar
+yamapData*.tar.gz
+
+# R / IDE
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
