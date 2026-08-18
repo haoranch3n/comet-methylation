@@ -28,21 +28,18 @@ generate_report <- function(qc_results = NULL,
 
   render_html <- has_rmarkdown && has_pandoc && has_DT && has_knitr
 
-  if (!has_rmarkdown) message("Package 'rmarkdown' not available — skipping HTML report.")
-  if (has_rmarkdown && !has_pandoc) message("pandoc not found — skipping HTML report. ",
+  if (!has_rmarkdown) message("Package 'rmarkdown' not available \u2014 skipping HTML report.")
+  if (has_rmarkdown && !has_pandoc) message("pandoc not found \u2014 skipping HTML report. ",
     "On HPC, try: module load pandoc  or set RSTUDIO_PANDOC.")
-  if (!has_DT)    message("Package 'DT' not available — skipping HTML report.")
-  if (!has_knitr) message("Package 'knitr' not available — skipping HTML report.")
+  if (!has_DT)    message("Package 'DT' not available \u2014 skipping HTML report.")
+  if (!has_knitr) message("Package 'knitr' not available \u2014 skipping HTML report.")
 
   if (render_html) {
     message("Generating HTML report...")
 
-    # Ensure output dir exists and resolve to an absolute path — rmarkdown::render
-    # changes the working directory, so relative paths break mid-render.
     dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
     abs_output_dir <- normalizePath(output_dir, winslash = "/", mustWork = TRUE)
 
-    # Save all results into a single RData file loaded by the Rmd
     report_data <- list(
       qc_results      = qc_results,
       dim_reduction   = dim_reduction,
@@ -53,11 +50,9 @@ generate_report <- function(qc_results = NULL,
     )
     save(report_data, file = file.path(abs_output_dir, "report_data.RData"))
 
-    # Write the Rmd template (absolute path so pandoc's chdir doesn't break it)
     rmd_file  <- create_report_rmd(abs_output_dir)
     html_file <- file.path(abs_output_dir, "methylation_analysis_report.html")
 
-    # Render — catch errors so a rendering failure never kills the pipeline
     render_ok <- tryCatch({
       rmarkdown::render(
         input       = rmd_file,
@@ -65,8 +60,8 @@ generate_report <- function(qc_results = NULL,
         output_dir  = abs_output_dir,
         intermediates_dir = abs_output_dir,
         knit_root_dir     = abs_output_dir,
-        quiet       = FALSE,          # show render progress/errors
-        envir       = new.env()       # clean environment for reproducibility
+        quiet       = FALSE,
+        envir       = new.env()
       )
       TRUE
     }, error = function(e) {
@@ -82,7 +77,6 @@ generate_report <- function(qc_results = NULL,
     }
   }
 
-  # Always produce a plain-text report as a reliable fallback
   if (is.null(report_files$html)) {
     text_report <- generate_text_report(qc_results, dim_reduction, cnv_data, sample_info)
     text_file   <- file.path(output_dir, "methylation_analysis_report.txt")
@@ -99,7 +93,6 @@ generate_report <- function(qc_results = NULL,
 #' @param output_dir Output directory
 #' @return Path to created Rmd file
 create_report_rmd <- function(output_dir) {
-  # Create the YAML header with proper date formatting
   yaml_header <- paste0('---
 title: "MeQTrack Analysis Report"
 author: "Methylation Pipeline"
@@ -110,84 +103,78 @@ output:
     toc_float: true
     theme: cosmo
     highlight: tango
+    self_contained: true
 ---')
 
-  # Create the R Markdown content body
   rmd_body <- '
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
-                      fig.width = 10, fig.height = 7)
-library(ggplot2)
+                      results = "asis")
 library(DT)
 library(knitr)
 
-# Load report data saved by generate_report()
 load("report_data.RData")
 
-# ------------------------------------------------------------------
-# Helper: resolve a stored plot path to one that actually exists.
-# Tries the stored path first, then looks for the file by basename
-# inside the known output module directories, then falls back to
-# relative paths from the reports directory.
-# ------------------------------------------------------------------
+# Resolve a stored plot path to one that actually exists on disk.
+# Prefers PNG over PDF at every candidate location.
 resolve_plot_path <- function(stored_path, module_dir = NULL) {
   if (is.null(stored_path) || is.na(stored_path) || !nzchar(stored_path)) return(NULL)
-
-  # 1. Stored path already valid
   if (file.exists(stored_path)) return(stored_path)
-
-  fname <- basename(stored_path)
-
-  # 2. Look for the file in the supplied module directory
+  if (grepl("[.]pdf$", stored_path, ignore.case = TRUE)) {
+    png_alt <- sub("[.]pdf$", ".png", stored_path)
+    if (file.exists(png_alt)) return(png_alt)
+  }
+  fname     <- basename(stored_path)
+  fname_png <- sub("[.]pdf$", ".png", fname, ignore.case = TRUE)
   if (!is.null(module_dir) && nzchar(module_dir)) {
-    candidate <- file.path(module_dir, fname)
-    if (file.exists(candidate)) return(candidate)
-    # Also try one level deeper (e.g. qc/plots/)
-    candidate2 <- file.path(module_dir, "plots", fname)
-    if (file.exists(candidate2)) return(candidate2)
+    for (fn in unique(c(fname_png, fname))) {
+      candidate <- file.path(module_dir, fn)
+      if (file.exists(candidate)) return(candidate)
+      candidate2 <- file.path(module_dir, "plots", fn)
+      if (file.exists(candidate2)) return(candidate2)
+    }
   }
-
-  # 3. Look relative to the reports directory (where we are rendering)
-  for (rel in c(
-      file.path("..", "figures", "qc",            fname),
-      file.path("..", "figures", "dim_reduction", fname),
-      file.path("..", "figures", "cnv",           fname),
-      file.path("..", "qc", "plots",              fname),
-      file.path("..", "qc",                       fname),
-      file.path("..", "dimensionality_reduction", fname),
-      file.path("..", "cnv",                      fname),
-      file.path("..", "cnv", "plots",             fname),
-      fname
-  )) {
-    if (file.exists(rel)) return(rel)
+  dirs <- c(file.path("..", "figures", "qc"),
+            file.path("..", "figures", "cnv"),
+            file.path("..", "qc", "plots"), file.path("..", "qc"),
+            file.path("..", "cnv"), file.path("..", "cnv", "plots"), ".")
+  for (d in dirs) {
+    for (fn in unique(c(fname_png, fname))) {
+      rel <- file.path(d, fn)
+      if (file.exists(rel)) return(rel)
+    }
   }
-
-  # 4. Return NULL so callers can show "not available" gracefully
   return(NULL)
 }
 
-# Convenience wrapper: include a static plot (PDF or PNG) or show a message
-show_plot <- function(path, caption = "") {
-  path <- resolve_plot_path(path)
-  if (!is.null(path)) {
-    knitr::include_graphics(path)
-  } else {
-    cat("*Plot not available*\n\n")
+# Emit a base64-encoded <img> tag via cat() (works with results="asis").
+embed_img <- function(path) {
+  if (is.null(path) || !file.exists(path)) {
+    cat("*Plot not available*\\n\\n"); return(invisible(NULL))
   }
+  uri <- knitr::image_uri(path)
+  cat(sprintf("<img src=\\"%s\\" alt=\\"%s\\" style=\\"width:100%%;max-width:1100px;height:auto;display:block;margin:1.25em auto;\\" />\\n\\n",
+              uri, basename(path)))
+  invisible(path)
 }
 
-# Convenience: make a datatable or print a message
 show_table <- function(df, caption = "", ...) {
   if (!is.null(df) && is.data.frame(df) && nrow(df) > 0) {
-    DT::datatable(df, caption = caption,
-                  options = list(pageLength = 10, scrollX = TRUE), ...)
+    w <- DT::datatable(df, caption = caption,
+                       options = list(pageLength = 10, scrollX = TRUE), ...)
+    cat(knitr::knit_print(w))
   } else {
-    cat("*Table not available*\n\n")
+    cat("*Table not available*\\n\\n")
   }
 }
 
-# Pull directories from report_data
-odirs <- report_data$output_dirs   # may be NULL if pipeline is old
+odirs <- report_data$output_dirs
+```
+
+```{r report_css}
+cat("<style>
+.main-container img { display:block; width:100%!important; max-width:1100px; margin:1.25em auto; height:auto; }
+</style>\\n")
 ```
 
 # Overview
@@ -210,7 +197,7 @@ has_qc <- !is.null(qc)
 ```{r qc_summary, eval=has_qc}
 n_pass <- length(qc$passed_samples)
 n_fail <- length(qc$failed_samples)
-cat(sprintf("**%d samples passed QC** | **%d samples failed QC**\n\n", n_pass, n_fail))
+cat(sprintf("**%d samples passed QC** | **%d samples failed QC**\\n\\n", n_pass, n_fail))
 ```
 
 ## QC Metrics Table
@@ -228,7 +215,7 @@ cat("No QC results available.")
 ```{r qc_detp, eval=has_qc}
 p <- resolve_plot_path(qc$plots$mean_detection_pvalue,
                        if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+embed_img(p)
 ```
 
 ## Beta Density
@@ -236,7 +223,7 @@ if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
 ```{r qc_density, eval=has_qc}
 p <- resolve_plot_path(qc$plots$beta_density,
                        if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+embed_img(p)
 ```
 
 ## Beta Bean Plot
@@ -244,7 +231,7 @@ if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
 ```{r qc_bean, eval=has_qc}
 p <- resolve_plot_path(qc$plots$beta_bean,
                        if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+embed_img(p)
 ```
 
 ## MDS Plot
@@ -252,7 +239,7 @@ if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
 ```{r qc_mds, eval=has_qc}
 p <- resolve_plot_path(qc$plots$mds,
                        if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+embed_img(p)
 ```
 
 ## Interactive Plots
@@ -262,75 +249,9 @@ idens <- resolve_plot_path(qc$plots$interactive_density,
                            if (!is.null(odirs)) odirs$figures_qc else NULL)
 imds  <- resolve_plot_path(qc$plots$interactive_mds,
                            if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(idens)) cat(sprintf("[Interactive density plot](%s)\n\n", basename(idens)))
-if (!is.null(imds))  cat(sprintf("[Interactive MDS plot](%s)\n\n",     basename(imds)))
-if (is.null(idens) && is.null(imds)) cat("*Interactive plots not available*\n\n")
-```
-
-# Dimensionality Reduction {.tabset}
-
-```{r dr_check}
-dr     <- report_data$dim_reduction
-has_dr <- !is.null(dr)
-dr_dir <- if (!is.null(odirs)) odirs$figures_dim_reduction else NULL
-```
-
-## t-SNE
-
-```{r tsne_results, eval=has_dr && !is.null(dr$tsne)}
-tsne <- dr$tsne
-# coords field (actual name from dim_reduction.R)
-coords_df <- tsne$coords
-if (!is.null(coords_df) && is.data.frame(coords_df)) {
-  show_table(coords_df, caption = "t-SNE Coordinates")
-}
-
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "tsne_plot.pdf"),
-                       dr_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*t-SNE plot not available*\n\n")
-
-if (length(tsne$duplicates) > 0) {
-  cat("\n**Duplicate samples removed before t-SNE:**",
-      paste(tsne$duplicates, collapse = ", "), "\n\n")
-}
-```
-
-```{r tsne_unavailable, eval=!has_dr || is.null(dr$tsne)}
-cat("No t-SNE results available.")
-```
-
-## UMAP
-
-```{r umap_results, eval=has_dr && !is.null(dr$umap)}
-umap_res <- dr$umap
-coords_df <- umap_res$coords
-if (!is.null(coords_df) && is.data.frame(coords_df)) {
-  show_table(coords_df, caption = "UMAP Coordinates")
-}
-
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "umap_plot.pdf"),
-                       dr_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*UMAP plot not available*\n\n")
-```
-
-```{r umap_unavailable, eval=!has_dr || is.null(dr$umap)}
-cat("No UMAP results available.")
-```
-
-## Hierarchical Clustering
-
-```{r hclust_results, eval=has_dr && !is.null(dr$hclust)}
-hcl <- dr$hclust
-cat(sprintf("**Method:** %s | **Distance:** %s\n\n",
-            hcl$method, hcl$distance))
-
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "hclust_dendrogram.pdf"),
-                       dr_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Dendrogram not available*\n\n")
-```
-
-```{r hclust_unavailable, eval=!has_dr || is.null(dr$hclust)}
-cat("No hierarchical clustering results available.")
+if (!is.null(idens)) cat(sprintf("[Interactive density plot](%s)\\n\\n", basename(idens)))
+if (!is.null(imds))  cat(sprintf("[Interactive MDS plot](%s)\\n\\n",     basename(imds)))
+if (is.null(idens) && is.null(imds)) cat("*Interactive plots not available*\\n\\n")
 ```
 
 # Copy Number Variation Analysis {.tabset}
@@ -344,7 +265,7 @@ cnv_dir  <- if (!is.null(odirs)) odirs$figures_cnv else NULL
 ## CNV Segments
 
 ```{r cnv_segments, eval=has_cnv}
-cat(sprintf("CNV analysis method: **%s**\n\n",
+cat(sprintf("CNV analysis method: **%s**\\n\\n",
             if (!is.null(cnv_data$method)) cnv_data$method else "unknown"))
 show_table(cnv_data$segments, caption = "CNV Segments")
 ```
@@ -357,7 +278,7 @@ cat("No CNV analysis results available.")
 
 ```{r cnv_freq, eval=has_cnv}
 p <- resolve_plot_path(cnv_data$frequency_plot, cnv_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*CNV frequency plot not available*\n\n")
+embed_img(p)
 ```
 
 ## Individual Sample Profiles
@@ -368,34 +289,22 @@ for (res in cnv_data$sample_results) {
   if (!is.null(res$plot_file)) {
     p <- resolve_plot_path(res$plot_file, cnv_dir)
     if (!is.null(p)) {
-      cat("### Sample:", res$sample_id, "\n\n")
-      print(knitr::include_graphics(p))
-      cat("\n\n")
+      cat("### Sample:", res$sample_id, "\\n\\n")
+      embed_img(p)
       plots_found <- plots_found + 1L
     }
   }
 }
 if (plots_found == 0L) {
-  cat(sprintf("*No individual CNV plots found (expected %d samples)*\n\n",
+  cat(sprintf("*No individual CNV plots found (expected %d samples)*\\n\\n",
               length(cnv_data$sample_results)))
 }
 ```
-
-# Session Information
-
-```{r session_info}
-cat("Report generated on:", format(report_data$generation_time, "%Y-%m-%d %H:%M:%S"), "\n\n")
-sessionInfo()
-```
 '
 
-  # Combine header and body
   rmd_content <- paste0(yaml_header, rmd_body)
-
-  # Write the Rmd file
   rmd_file <- file.path(output_dir, "methylation_analysis_report.Rmd")
   writeLines(rmd_content, rmd_file)
-
   return(rmd_file)
 }
 
@@ -419,7 +328,6 @@ generate_text_report <- function(qc_results, dim_reduction, cnv_data, sample_inf
     ""
   )
 
-  # QC summary
   if (!is.null(qc_results)) {
     report_lines <- c(report_lines,
       "Quality Control Summary",
@@ -431,39 +339,6 @@ generate_text_report <- function(qc_results, dim_reduction, cnv_data, sample_inf
     )
   }
 
-  # Dimensionality reduction summary
-  if (!is.null(dim_reduction)) {
-    report_lines <- c(report_lines,
-      "Dimensionality Reduction Summary",
-      "-------------------------------"
-    )
-
-    if (!is.null(dim_reduction$tsne)) {
-      n_samp <- if (!is.null(dim_reduction$tsne$coords)) nrow(dim_reduction$tsne$coords) else "unknown"
-      report_lines <- c(report_lines,
-        paste("t-SNE: samples =", n_samp),
-        ""
-      )
-    }
-
-    if (!is.null(dim_reduction$umap)) {
-      n_samp <- if (!is.null(dim_reduction$umap$coords)) nrow(dim_reduction$umap$coords) else "unknown"
-      report_lines <- c(report_lines,
-        paste("UMAP: samples =", n_samp),
-        ""
-      )
-    }
-
-    if (!is.null(dim_reduction$hclust)) {
-      report_lines <- c(report_lines,
-        paste("Hierarchical clustering: method =", dim_reduction$hclust$method,
-              "| distance =", dim_reduction$hclust$distance),
-        ""
-      )
-    }
-  }
-
-  # CNV analysis summary
   if (!is.null(cnv_data)) {
     report_lines <- c(report_lines,
       "Copy Number Variation Analysis Summary",
@@ -485,7 +360,6 @@ generate_text_report <- function(qc_results, dim_reduction, cnv_data, sample_inf
 create_interactive_plots <- function(results, output_dir = ".") {
   plots <- list()
 
-  # Check if required packages are available
   has_plotly <- requireNamespace("plotly", quietly = TRUE)
   has_htmlwidgets <- requireNamespace("htmlwidgets", quietly = TRUE)
 

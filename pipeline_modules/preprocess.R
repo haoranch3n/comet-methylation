@@ -293,6 +293,18 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   detection_p <- sesame::openSesame(sample_sheet$Basename, func = pOOBAH,
                                     return.pval = TRUE, BPPARAM = bpparam)
 
+  # Single-sample openSesame returns a named vector (no dim / rownames).
+  # Coerce to a 1-column matrix BEFORE the EPICv2 replicate-collapse below,
+  # which keys off rownames(). Otherwise, for single-sample EPICv2 uploads,
+  # beta gets collapsed to per-CpG IDs (collapseToPfx=TRUE) while detection_p
+  # keeps the _TC/_BC replicate suffixes, and filter_probes sees 0 shared
+  # probes ("Probe-name mismatch ... share 0 probe IDs").
+  if (is.null(dim(detection_p))) {
+    detection_p <- matrix(detection_p, ncol = 1,
+                          dimnames = list(names(detection_p),
+                                          basename(sample_sheet$Basename[1])))
+  }
+
   if (array_type == "EPICv2" &&
       any(grepl("_(BC|TC)\\d+$", utils::head(rownames(detection_p), 200)))) {
     message("Collapsing EPICv2 detection_p replicates -> one row per CpG (mean)...")
@@ -314,13 +326,7 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
             nrow(detection_p), " x ", ncol(detection_p))
   }
 
-  # Same single-sample guard: as.data.frame on a vector yields 1 column,
-  # but [, match(...)] on a 1-column data.frame drops to a vector without drop=FALSE.
-  if (is.null(dim(detection_p))) {
-    detection_p <- matrix(detection_p, ncol = 1,
-                          dimnames = list(names(detection_p),
-                                          basename(sample_sheet$Basename[1])))
-  }
+  # (detection_p was already coerced to a matrix above, before the collapse.)
   detection_p_df = as.data.frame(detection_p)
   detection_p_df <- detection_p_df[, match(sample_sheet$Sentrix_ID, colnames(detection_p_df)), drop = FALSE]
   message("Number of rows in detection_p: ", nrow(detection_p)) 
@@ -351,17 +357,17 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   } else {
     sample_info$pred_sex <- as.character(pred_sex)
   }
+  rm(mset_raw, gset, pred_sex)
+  gc()
 
   fwrite(detection_p_df, file=file.path(output_dir, "detection_p.txt"), row.names=TRUE, sep="\t")
-  m_values = BetaValueToMValue(beta)
   message("Done Preprocessing!")
   write.table(sample_info, file=file.path(output_dir, "sample_info.txt"), row.names=TRUE, sep="\t")
 
-  # Create result object
+  # Create result object (m_values omitted — compute on demand if needed downstream)
   result <- list(
     rgset = rgset,
     beta = beta,
-    m_values = m_values,
     detection_p = detection_p_df,
     sample_info = sample_info,
     array_type = if (array_type == "auto") determine_array_type(rgset) else array_type,

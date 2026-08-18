@@ -32,6 +32,8 @@ perform_qc <- function(rgset, beta_values, sample_info,
   mean_detP            <- colMeans(detP)
   failed_probes_count  <- colSums(detP > detection_p_threshold)
   failed_probes_percent <- failed_probes_count / nrow(detP) * 100
+  sample_ids           <- colnames(detP)
+  rm(detP)
 
   # ---------------------------------------------------------------------------
   # Median intensity via minfi QC (raw, pre-normalisation)
@@ -41,12 +43,11 @@ perform_qc <- function(rgset, beta_values, sample_info,
   mfi_qc        <- minfi::getQC(ms_raw)
   median_meth   <- setNames(mfi_qc$mMed, rownames(mfi_qc))
   median_unmeth <- setNames(mfi_qc$uMed, rownames(mfi_qc))
+  rm(mfi_qc)
 
   # ---------------------------------------------------------------------------
   # Build per-sample QC table
   # ---------------------------------------------------------------------------
-  sample_ids <- colnames(detP)
-
   sample_qc <- data.frame(
     Sample_ID                    = sample_ids,
     Mean_Detection_P             = mean_detP[sample_ids],
@@ -94,6 +95,7 @@ perform_qc <- function(rgset, beta_values, sample_info,
       qc_swan    <- minfi::getQC(ms_swan)
       swan_meth  <- setNames(qc_swan$mMed, rownames(qc_swan))
       swan_unmeth <- setNames(qc_swan$uMed, rownames(qc_swan))
+      rm(ms_swan, qc_swan)
 
       for (sid in low_int_ids) {
         if (sid %in% names(swan_meth)) {
@@ -122,6 +124,8 @@ perform_qc <- function(rgset, beta_values, sample_info,
       warning("SWAN normalisation check failed: ", e$message)
     })
   }
+  rm(ms_raw)
+  gc()
 
   # ---------------------------------------------------------------------------
   # Human-readable failure reason (detection p / probe rate only)
@@ -189,7 +193,7 @@ perform_qc <- function(rgset, beta_values, sample_info,
   # ---------------------------------------------------------------------------
   # QC plots
   # ---------------------------------------------------------------------------
-  qc_plots <- generate_qc_plots(rgset, detP, beta_values, sample_qc,
+  qc_plots <- generate_qc_plots(rgset, NULL, beta_values, sample_qc,
                                 detection_p_threshold, sample_detection_p_threshold,
                                 plots_dir)
 
@@ -235,7 +239,6 @@ perform_qc <- function(rgset, beta_values, sample_info,
     low_intensity_samples        = sample_qc$Sample_ID[sample_qc$Note_Low_Intensity],
     swan_recoverable             = sample_qc$Sample_ID[sample_qc$SWAN_Recoverable %in% TRUE],
     swan_not_recoverable         = sample_qc$Sample_ID[sample_qc$SWAN_Recoverable %in% FALSE],
-    detection_p                  = detP,
     detection_p_threshold        = detection_p_threshold,
     sample_detection_p_threshold = sample_detection_p_threshold,
     plots                        = qc_plots
@@ -259,70 +262,79 @@ generate_qc_plots <- function(rgset, detP, beta_values, sample_qc,
                               output_dir = ".") {
   plots <- list()
   
-  # 1. Mean detection p-value plot
+  # 1. Mean detection p-value plot (PNG)
   message("Generating mean detection p-value plot...")
-  pdf_path <- file.path(output_dir, "mean_detection_pvalue.pdf")
-  pdf(pdf_path, height = 8, width = 12)
-  barplot(sample_qc$Mean_Detection_P, 
-          names.arg = sample_qc$Sample_ID, 
-          las = 2, 
-          cex.names = 0.8,
-          col = ifelse(sample_qc$Pass_QC, "forestgreen", "firebrick"),
-          main = "Mean Detection P-value by Sample",
-          ylab = "Mean Detection P-value")
-  abline(h = sample_detection_p_threshold, col = "red", lty = 2)
-  text(x = par("usr")[2] * 0.95, 
-       y = sample_detection_p_threshold * 1.1, 
-       labels = paste("Threshold (", sample_detection_p_threshold, ")", sep = ""), 
-       cex = 0.8)
+  png_path <- file.path(output_dir, "mean_detection_pvalue.png")
+  png(png_path, height = 600, width = 900, res = 150)
+  if (nrow(sample_qc) == 1L) {
+    val <- sample_qc$Mean_Detection_P[1L]
+    pass <- sample_qc$Pass_QC[1L]
+    par(mar = c(5, 6, 4, 2))
+    barplot(val, names.arg = sample_qc$Sample_ID, col = if (pass) "forestgreen" else "firebrick",
+            main = "Mean Detection P-value", ylab = "Mean Detection P-value",
+            ylim = c(0, max(val * 2, sample_detection_p_threshold * 1.5)),
+            las = 1, cex.names = 0.8)
+    abline(h = sample_detection_p_threshold, col = "red", lty = 2)
+    text(x = 0.7, y = sample_detection_p_threshold * 1.08,
+         labels = sprintf("Threshold (%g)", sample_detection_p_threshold), cex = 0.7, adj = 0)
+    text(x = 0.7, y = val, labels = sprintf("%.2e", val), pos = 3, cex = 0.8)
+  } else {
+    barplot(sample_qc$Mean_Detection_P,
+            names.arg = sample_qc$Sample_ID, las = 2, cex.names = 0.8,
+            col = ifelse(sample_qc$Pass_QC, "forestgreen", "firebrick"),
+            main = "Mean Detection P-value by Sample",
+            ylab = "Mean Detection P-value")
+    abline(h = sample_detection_p_threshold, col = "red", lty = 2)
+    text(x = par("usr")[2] * 0.95, y = sample_detection_p_threshold * 1.1,
+         labels = sprintf("Threshold (%g)", sample_detection_p_threshold), cex = 0.8)
+  }
   dev.off()
-  plots$mean_detection_pvalue <- pdf_path
+  plots$mean_detection_pvalue <- png_path
   
-  # 2. Sample density plot
+  # 2. Sample density plot (PNG)
   message("Generating sample density plot...")
-  pdf_path <- file.path(output_dir, "beta_density.pdf")
-  pdf(pdf_path, height = 8, width = 10)
-  densityPlot(beta_values, 
-              sampGroups = sample_qc$Pass_QC, 
+  png_path <- file.path(output_dir, "beta_density.png")
+  png(png_path, height = 600, width = 750, res = 150)
+  densityPlot(beta_values,
+              sampGroups = sample_qc$Pass_QC,
               main = "Beta Value Density Plot",
               legend = FALSE)
-  legend("topright", 
-         legend = c("Pass QC", "Fail QC"), 
-         col = c("black", "red"), 
+  legend("topright",
+         legend = c("Pass QC", "Fail QC"),
+         col = c("black", "red"),
          lty = 1)
   dev.off()
-  plots$beta_density <- pdf_path
+  plots$beta_density <- png_path
   
-  # 3. Bean plot for beta distribution
+  # 3. Bean plot for beta distribution (PNG)
   message("Generating bean plot...")
-  pdf_path <- file.path(output_dir, "beta_bean_plot.pdf")
-  pdf(pdf_path, height = 8, width = 10)
-  densityBeanPlot(beta_values, 
+  png_path <- file.path(output_dir, "beta_bean_plot.png")
+  png(png_path, height = 600, width = 750, res = 150)
+  densityBeanPlot(beta_values,
                   sampGroups = sample_qc$Pass_QC,
                   main = "Beta Value Distribution")
   dev.off()
-  plots$beta_bean <- pdf_path
+  plots$beta_bean <- png_path
   
  
-  # 4. MDS plot if we have more than 3 samples
+  # 4. MDS plot if we have more than 3 samples (PNG)
   if (ncol(beta_values) > 3) {
     message("Generating MDS plot...")
-    pdf_path <- file.path(output_dir, "mds_plot.pdf")
-    pdf(pdf_path, height = 8, width = 10)
-    
-    # Use tryCatch in case MDS calculation fails
+    png_path <- file.path(output_dir, "mds_plot.png")
+    png(png_path, height = 900, width = 750, res = 150)
+
     tryCatch({
       mds <- cmdscale(dist(t(beta_values)), k = 3)
       colnames(mds) <- c("PC1", "PC2", "PC3")
       par(mfrow = c(2, 1))
-      plot(mds[, 1], mds[, 2], 
+      plot(mds[, 1], mds[, 2],
            col = ifelse(sample_qc$Pass_QC, "blue", "red"),
            pch = 19,
            main = "MDS Plot - PC1 vs PC2",
            xlab = "PC1", ylab = "PC2")
       text(mds[, 1], mds[, 2], labels = sample_qc$Sample_ID, pos = 3, cex = 0.8)
-      
-      plot(mds[, 1], mds[, 3], 
+
+      plot(mds[, 1], mds[, 3],
            col = ifelse(sample_qc$Pass_QC, "blue", "red"),
            pch = 19,
            main = "MDS Plot - PC1 vs PC3",
@@ -334,9 +346,9 @@ generate_qc_plots <- function(rgset, detP, beta_values, sample_qc,
       text(1, 0.8, e$message, col = "red")
       warning("Could not generate MDS plot: ", e$message)
     })
-    
+
     dev.off()
-    plots$mds <- pdf_path
+    plots$mds <- png_path
   }
   
   # Create interactive plots using plotly if requested

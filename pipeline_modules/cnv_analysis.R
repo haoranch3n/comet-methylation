@@ -433,21 +433,18 @@ process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_d
   # Segment the data
   cnv_segment <- CNV.segment(cnv_detail)
   
-  # Plot genome-wide CNV profile.
-  # `cols` is a 5-stop palette interpolated low→high (loss→neutral→gain):
-  # dark teal → light teal → neutral grey → light brown → dark brown.
-  # Matches the CNV heatmap's teal/brown diverging scheme.
-  pdf_file <- file.path(plots_dir, paste0(clean_sample_id, "_cnv_profile.pdf"))
-  pdf(pdf_file)
+  # Plot genome-wide CNV profile as PNG so COMET Explorer can render it the
+  # same way as the pre-computed reference cnv_plots/*.png assets
+  # (3600×1800 px = 12×6 in at 300 dpi; red/green diverging palette).
+  cnv_viewer_cols <- c("darkgreen", "green", "grey90", "red", "red")
+  plot_file <- file.path(plots_dir, paste0(clean_sample_id, "_cnv_profile.png"))
+  grDevices::png(plot_file, width = 12, height = 6, units = "in", res = 300)
   CNV.genomeplot(
     cnv_segment,
     main = clean_sample_id,
-    cols = c("#018571", "#80cdc1", "#f5f5f5", "#dfc27d", "#a6611a")
+    cols = cnv_viewer_cols
   )
-  # Gain/loss threshold lines: neutral grey so they don't clash with the
-  # new teal/brown palette.
-  abline(h = c(-0.2, 0.2), lty = 2, col = "grey50")
-  dev.off()
+  grDevices::dev.off()
   
   # Save segment results
   seg_file <- file.path(seg_dir, paste0(clean_sample_id, "_cnv_segments.seg"))
@@ -486,7 +483,7 @@ process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_d
     segments = segments_df,
     bins = cnv_bin,
     segments_file = seg_file,
-    plot_file = pdf_file
+    plot_file = plot_file
   )
 }
 
@@ -610,16 +607,15 @@ generate_cnv_frequency_plot <- function(segments, threshold = 0.18, output_dir =
     return(NULL)
   }
   
-  # Generate plot
-  pdf_path <- file.path(output_dir, "cnv_frequency_plot.pdf")
-  pdf(pdf_path, width = 12, height = 5)
-  
-  # Call the freqplot function
+  # Generate plot (PNG for direct HTML embedding)
+  png_path <- file.path(output_dir, "cnv_frequency_plot.png")
+  png(png_path, width = 12, height = 5, units = "in", res = 200)
+
   freqplot(segments, threshold = threshold, plot.title = "CNV Frequency Plot")
-  
+
   dev.off()
-  
-  return(pdf_path)
+
+  return(png_path)
 }
 
 #' Source freqplot functions

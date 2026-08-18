@@ -108,6 +108,7 @@ default_config <- function() {
 
     # CNV analysis
     cnv = list(
+      enabled        = TRUE,        # Set FALSE (or pass --disable_cnv) to skip CNV entirely
       method         = "conumee",   # Options: conumee, ChAMP, cnAnalysis450k
       threshold      = 0.18,
       frequency_plot = TRUE

@@ -48,7 +48,9 @@ option_list <- list(
   make_option(c("-i", "--input"), type="character", default="./example/sample_sheet.csv",
               help="Path to sample sheet CSV file", metavar="file"),
   make_option("--hpc", action="store_true", default=FALSE,
-              help="Generate HPC submission scripts")
+              help="Generate HPC submission scripts"),
+  make_option("--disable_cnv", action="store_true", default=FALSE,
+              help="Skip CNV analysis entirely (omits conumee2/yamapData loading; overrides --step all)")
 )
 
 opt_parser <- OptionParser(
@@ -60,7 +62,7 @@ opt <- parse_args(opt_parser)
 
 
 
-# Load necessary libraries
+# Load necessary libraries (CNV-specific packages loaded lazily inside the CNV block)
 suppressPackageStartupMessages({
   library(data.table)
   library(limma)
@@ -76,9 +78,7 @@ suppressPackageStartupMessages({
   library(umap)
   library(dendextend)
   library(parallel)
-  library(conumee2)
   library(sesame)
-  library(yamapData)
 })
 
 # Set working directory to the script's location so relative paths work
@@ -117,6 +117,12 @@ if (!is.null(opt$config)) {
 } else {
   config <- default_config()
 }
+
+# --disable_cnv CLI flag overrides config$cnv$enabled
+if (isTRUE(opt$disable_cnv)) {
+  config$cnv$enabled <- FALSE
+}
+run_cnv <- isTRUE(config$cnv$enabled)
 
 # Override sample_sheet path if provided via command line
 if (!is.null(opt$input)) {
@@ -177,7 +183,6 @@ run_pipeline <- function(step) {
     
     # Extract key components
     beta_values <- result$beta
-    m_values <- result$m_values
     rgset <- result$rgset
     sample_info <- result$sample_info
     detection_p <- result$detection_p
@@ -214,7 +219,6 @@ run_pipeline <- function(step) {
       
       # Extract key components
       beta_values <- result$beta
-      m_values <- result$m_values
       rgset <- result$rgset
       sample_info <- result$sample_info
       detection_p <- result$detection_p
@@ -287,10 +291,8 @@ run_pipeline <- function(step) {
                             paste(qc_results$failed_samples, collapse = ", ")),
                     log_file)
 
-        # Filter beta and M-value matrices
+        # Filter beta matrix
         beta_values <- beta_values[, colnames(beta_values) %in% passed_samples, drop = FALSE]
-        if (!is.null(m_values))
-          m_values <- m_values[, colnames(m_values) %in% passed_samples, drop = FALSE]
 
         # Filter RGChannelSet (enables downstream use of rgset with QC-passed samples)
         if (!is.null(rgset))
@@ -306,7 +308,6 @@ run_pipeline <- function(step) {
       # Save filtered data
       filtered_result <- list(
         beta        = beta_values,
-        m_values    = m_values,
         sample_info = sample_info
       )
       save(filtered_result, file = file.path(dirs$processed, "filtered_data.RData"))
@@ -419,6 +420,16 @@ run_pipeline <- function(step) {
     write_beta_values(filtered_beta, file.path(dirs$processed, "filtered_beta_values.txt"))
     
     log_message(paste("Filtering complete. Kept", nrow(filtered_beta), "probes."), log_file)
+
+    # Free large upstream objects no longer needed.
+    # rgset is kept only when the CNV step will actually run (it is the sole
+    # consumer of rgset downstream).
+    if (!run_cnv) {
+      if (exists("rgset")) { rm(rgset); rgset <- NULL }
+    }
+    if (exists("beta_values"))  rm(beta_values)
+    if (exists("detection_p"))  rm(detection_p)
+    gc()
   } else if (step != "preprocess" && step != "qc") {
     # Try to load filtered data if not running filtering
     log_message("Loading filtered beta values...", log_file)
@@ -552,7 +563,12 @@ run_pipeline <- function(step) {
     save(dim_reduction_results, file = file.path(dirs$dim_reduction, "dim_reduction_results.RData"))
   }
   
-  if (step == "all" || step == "cnv") {
+  if ((step == "all" || step == "cnv") && run_cnv) {
+    # Load CNV-specific packages here (not at startup) to keep memory low when CNV is disabled
+    suppressPackageStartupMessages({
+      library(conumee2)
+      library(yamapData)
+    })
     log_message("Step 4: Copy number variation analysis", log_file)
     
     # Ensure array_type is available for CNV analysis
