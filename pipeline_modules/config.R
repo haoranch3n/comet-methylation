@@ -77,6 +77,7 @@ default_config <- function() {
       sample_detection_p_threshold   = 0.05,
       failed_probe_percent_threshold = 25,
       min_median_intensity           = 10.5,
+      max_gct_score                  = 1.8,   # GCT bisulfite-conversion fail cutoff (~1.0 = complete)
       filter_failed_samples          = TRUE
     ),
 
@@ -106,12 +107,35 @@ default_config <- function() {
       )
     ),
 
-    # CNV analysis
+    # CNV analysis. Asymmetric gain/loss thresholds:
+    # a segment is called a gain when seg.mean > gain_threshold and a loss
+    # when seg.mean < loss_threshold. The legacy single `threshold` key is
+    # still honoured (treated as |threshold|, applied symmetrically) for
+    # backward compatibility with run_manifest.json files written by older
+    # versions of MeQTrack.
     cnv = list(
-      enabled        = TRUE,        # Set FALSE (or pass --disable_cnv) to skip CNV entirely
-      method         = "conumee",   # Options: conumee, ChAMP, cnAnalysis450k
-      threshold      = 0.18,
-      frequency_plot = TRUE
+      method          = "conumee",   # Options: conumee, ChAMP, cnAnalysis450k
+      gain_threshold  =  0.15,
+      loss_threshold  = -0.20,
+      frequency_plot  = TRUE
+    ),
+
+    # Reference projection (v2.0.0). Projects the user's samples onto a
+    # pre-trained reference t-SNE embedding via snifter. `reference_dir`
+    # is resolved relative to the pipeline/ directory when not absolute.
+    reference_projection = list(
+      enabled       = TRUE,
+      dataset       = "COMET_1915",   # key into .REFERENCE_DATASETS
+      reference_dir = "../reference",
+      perplexity    = 5,
+      knn_k         = 25              # neighbours for the nearest-class diagnostic
+    ),
+
+    # Cell-type deconvolution (deconvMe). Opt-in step (--step deconvolution),
+    # NOT part of --step all. EpiDISH + Houseman are pure-R; methylcc/methatlas
+    # need a Python backend and methatlas is research-license-only.
+    deconvolution = list(
+      methods = c("epidish", "houseman")
     ),
 
     # Output
@@ -133,6 +157,8 @@ setup_directories <- function(main_dir) {
     qc                    = file.path(main_dir, "qc"),
     dim_reduction         = file.path(main_dir, "dimensionality_reduction"),
     cnv                   = file.path(main_dir, "cnv"),
+    reference_projection  = file.path(main_dir, "reference_projection"),
+    deconv                = file.path(main_dir, "deconv"),
     figures               = figures,
     figures_qc            = file.path(figures, "qc"),
     figures_dim_reduction = file.path(figures, "dim_reduction"),

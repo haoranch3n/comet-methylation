@@ -78,6 +78,9 @@ fix_column_names <- function(col_names) {
 #' @param plots_dir  Output directory for CNV plots. Defaults to
 #'                   \code{file.path(output_dir, "plots")} for backward compat.
 #' @param threads Number of CPU threads to use
+#' @param gain_threshold seg.mean cutoff above which a segment is called a gain
+#' @param loss_threshold seg.mean cutoff below which a segment is called a loss
+#'                       (signed; e.g. -0.2)
 #' @return List containing CNV results
 run_cnv_analysis <- function(rgset, sample_info,
                            references = NULL,
@@ -85,18 +88,27 @@ run_cnv_analysis <- function(rgset, sample_info,
                            array_type = "EPICv2",
                            output_dir = ".",
                            plots_dir  = NULL,
-                           threads = 4) {
+                           threads = 4,
+                           gain_threshold =  0.15,
+                           loss_threshold = -0.20) {
 
   message(paste("Running CNV analysis using", method, "method..."))
+
+  # Normalise signs so callers can pass either form.
+  gain_threshold <-  abs(gain_threshold)
+  loss_threshold <- -abs(loss_threshold)
 
   if (is.null(plots_dir)) plots_dir <- file.path(output_dir, "plots")
   cnv_seg_dir <- file.path(output_dir, "segments")
   dir.create(plots_dir,   showWarnings = FALSE, recursive = TRUE)
   dir.create(cnv_seg_dir, showWarnings = FALSE, recursive = TRUE)
-  
+
   # Select method
   if (method == "conumee") {
-    result <- run_conumee_cnv(rgset, sample_info, references, plots_dir, cnv_seg_dir, threads, array_type)
+    result <- run_conumee_cnv(rgset, sample_info, references, plots_dir, cnv_seg_dir,
+                              threads, array_type,
+                              gain_threshold = gain_threshold,
+                              loss_threshold = loss_threshold)
   } else if (method == "ChAMP") {
     result <- run_champ_cnv(rgset, sample_info, references, plots_dir, cnv_seg_dir, threads, array_type)
   } else {
@@ -115,12 +127,60 @@ run_cnv_analysis <- function(rgset, sample_info,
 #' @param seg_dir Output directory for CNV segment files
 #' @param threads Number of CPU threads to use
 #' @return List containing CNV results
-run_conumee_cnv <- function(rgset, sample_info, references, plots_dir, seg_dir, threads, array_type = "EPICv2") {
+#' Locate a prepared CNV control reference for an array platform.
+#'
+#' Looks for Anno/<platform>/<platform>_CNV_controls.rds, built once by
+#' scripts/build_cnv_controls.R. Returns NULL when no prepared reference
+#' exists for the platform, which is not an error — the caller falls back to
+#' the yamapData internal EPIC reference.
+#'
+#' The search mirrors qc.R::find_anno_file(): the pipeline is normally invoked
+#' from pipeline/, but may be sourced from the repo root or from the app.
+#'
+#' @param array_type Platform label, e.g. "EPICv2".
+#' @param anno_dir   Optional explicit Anno/ directory.
+#' @return Path to the .rds, or NULL.
+find_cnv_control_reference <- function(array_type, anno_dir = NULL) {
+  if (is.null(array_type) || !nzchar(array_type)) return(NULL)
+  # Canonicalise so "epicv2" and "EPICV2" both find Anno/EPICv2/.
+  plat <- switch(toupper(array_type),
+                 "450K" = "450K", "EPIC" = "EPIC", "EPICV2" = "EPICv2",
+                 array_type)
+  rel  <- file.path(plat, paste0(plat, "_CNV_controls.rds"))
 
-  # Check if conumee2 is available
-  if (!requireNamespace("conumee2", quietly = TRUE)) {
-    stop("Package 'conumee2' is required for conumee CNV analysis")
+  roots <- if (!is.null(anno_dir)) anno_dir else
+    c(file.path("..", "Anno"), "Anno", file.path(getwd(), "Anno"),
+      file.path(getwd(), "..", "Anno"))
+  for (r in roots) {
+    p <- file.path(r, rel)
+    if (file.exists(p)) return(normalizePath(p))
   }
+  NULL
+}
+
+run_conumee_cnv <- function(rgset, sample_info, references, plots_dir, seg_dir,
+                            threads, array_type = "EPICv2",
+                            gain_threshold =  0.15,
+                            loss_threshold = -0.20) {
+
+  # conumee2 + yamapData are attached here (not at the top of
+  # methylation_pipeline.R) so non-CNV steps stay runnable when these
+  # packages are missing. Both are required for this step — fail loudly
+  # with a message that points the user at setup.R rather than letting
+  # `library()` raise the bare "no package called X" error.
+  for (pkg in c("conumee2", "yamapData")) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      stop(
+        "Package '", pkg, "' is required for conumee CNV analysis but is ",
+        "not installed.\n  Re-run setup.R from the project root to provision ",
+        "the R library:\n    Rscript setup.R"
+      )
+    }
+  }
+  suppressPackageStartupMessages({
+    library(conumee2)
+    library(yamapData)
+  })
 
   # Normalize array_type to conumee2-accepted values (case-sensitive: 450k, EPIC, EPICv2, mouse)
   array_type <- switch(toupper(array_type),
@@ -131,21 +191,46 @@ run_conumee_cnv <- function(rgset, sample_info, references, plots_dir, seg_dir, 
     array_type  # pass through unknown values and let conumee2 error
   )
 
-  # Load reference samples if provided
+  # Reference controls, in priority order:
+  #   1. an explicit reference sample sheet (--cnv_references / config)
+  #   2. a prepared platform-matched .rds under Anno/<platform>/ , built once
+  #      by scripts/build_cnv_controls.R
+  #   3. the yamapData internal EPIC reference
+  #
+  # (2) matters most for EPICv2: yamapData is EPIC-based, so without our own
+  # EPICv2 controls the annotation has to be intersected down to EPIC probes
+  # (see anno_array_type below) purely to match the reference.
+  prepared <- find_cnv_control_reference(array_type)
+
   if (!is.null(references)) {
-    message("Loading reference samples...")
+    message("Loading reference samples from sample sheet...")
     ref_rgset <- read.metharray.exp(base = NULL, targets = references, recursive = TRUE)
-    #ref_rgset@annotation <- rgset@annotation
-    
-    # Preprocess reference samples
     ref_mset <- preprocessNoob(ref_rgset)
     ref_controls <- CNV.load(ref_mset)
+    using_matched_controls <- FALSE
+  } else if (!is.null(prepared)) {
+    obj <- readRDS(prepared)
+    ref_controls <- obj$controls
+    m <- obj$meta
+    message(sprintf("Using prepared %s CNV controls: %d samples x %d probes (built %s)",
+                    m$platform, m$n_samples, m$n_probes, m$built))
+    if (length(m$excluded)) {
+      message("  controls excluded at build time: ",
+              paste(m$excluded, collapse = ", "))
+    }
+    if (!identical(toupper(m$platform), toupper(array_type))) {
+      warning("Prepared controls are ", m$platform, " but the query is ",
+              array_type, "; falling back to probe intersection.")
+      using_matched_controls <- FALSE
+    } else {
+      using_matched_controls <- TRUE
+    }
   } else {
-    message("Using internal reference samples...")
-    # Load the yamapData internal reference dataset
+    message("Using internal yamapData reference samples...")
     ref
     ref_mset <- preprocessNoob(ref)
     ref_controls <- CNV.load(ref_mset)
+    using_matched_controls <- FALSE
   }
   
   # Create conumee annotation
@@ -157,9 +242,29 @@ run_conumee_cnv <- function(rgset, sample_info, references, plots_dir, seg_dir, 
     data("exclude_regions")
     data("detail_regions")
       
-    # For EPICv2 samples, create annotation using both EPIC and EPICv2 to get probe overlap
-    # with the internal EPIC reference controls. For 450k, use only 450k.
-    anno_array_type <- if (array_type == "450k") "450k" else c("EPIC", array_type)
+    # Annotation probe space.
+    #
+    # With platform-matched controls (a prepared reference built from IDATs of
+    # the same array) the annotation can be the query's own platform: query,
+    # reference and annotation already agree, so nothing needs intersecting.
+    # This keeps EPICv2-specific probes, giving denser bins than the fallback.
+    #
+    # Without them the reference is yamapData's EPIC panel, so an EPICv2 query
+    # must be intersected down to c("EPIC", "EPICv2") to share a probe space
+    # with it. That is a compatibility compromise, not the preferred path.
+    # 450k is always its own annotation.
+    anno_array_type <- if (array_type == "450k") {
+      "450k"
+    } else if (using_matched_controls) {
+      array_type
+    } else {
+      # unique() so an EPIC query does not become c("EPIC", "EPIC").
+      unique(c("EPIC", array_type))
+    }
+    message("CNV annotation probe space: ",
+            paste(anno_array_type, collapse = " + "),
+            if (using_matched_controls) "  (platform-matched controls)" else
+              "  (intersected for yamapData compatibility)")
     anno <- conumee2::CNV.create_anno(
       exclude_regions = exclude_regions,
       bin_minprobes = 15,
@@ -208,7 +313,9 @@ run_conumee_cnv <- function(rgset, sample_info, references, plots_dir, seg_dir, 
   # Use serial processing to avoid rgset serialization issues
   message("Processing samples in serial mode to avoid serialization issues...")
   results <- lapply(seq_len(n_samples), function(i) {
-    process_conumee_sample(rgset, sample_ids[i], ref_controls, anno, plots_dir, seg_dir)
+    process_conumee_sample(rgset, sample_ids[i], ref_controls, anno, plots_dir, seg_dir,
+                           gain_threshold = gain_threshold,
+                           loss_threshold = loss_threshold)
   })
   
   # Combine segment files for IGV
@@ -321,7 +428,9 @@ run_conumee_cnv <- function(rgset, sample_info, references, plots_dir, seg_dir, 
 #' @param plots_dir Output directory for CNV plots
 #' @param seg_dir Output directory for CNV segment files
 #' @return List containing sample CNV results
-process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_dir, seg_dir) {
+process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_dir, seg_dir,
+                                   gain_threshold =  0.15,
+                                   loss_threshold = -0.20) {
   message(paste("Processing sample:", sample_id))
   
   # Extract clean sample ID for file naming and output
@@ -433,18 +542,27 @@ process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_d
   # Segment the data
   cnv_segment <- CNV.segment(cnv_detail)
   
-  # Plot genome-wide CNV profile as PNG so COMET Explorer can render it the
-  # same way as the pre-computed reference cnv_plots/*.png assets
-  # (3600×1800 px = 12×6 in at 300 dpi; red/green diverging palette).
-  cnv_viewer_cols <- c("darkgreen", "green", "grey90", "red", "red")
-  plot_file <- file.path(plots_dir, paste0(clean_sample_id, "_cnv_profile.png"))
-  grDevices::png(plot_file, width = 12, height = 6, units = "in", res = 300)
+  # Plot genome-wide CNV profile.
+  # `cols` is a 5-stop palette interpolated low→high (loss→neutral→gain):
+  # dark teal → light teal → neutral grey → light brown → dark brown.
+  # Matches the CNV heatmap's teal/brown diverging scheme.
+  pdf_file <- file.path(plots_dir, paste0(clean_sample_id, "_cnv_profile.pdf"))
+  pdf(pdf_file, width = 10, height = 5)
+  # CNV.genomeplot draws the panel (with xlab=NA, ylab=NA) and manages par
+  # itself — touching par() around the call disrupts its internal title /
+  # chromosome / gene / y-axis drawing. So leave par alone and only add the
+  # axis titles afterwards; the default margins have room for them.
   CNV.genomeplot(
     cnv_segment,
     main = clean_sample_id,
-    cols = cnv_viewer_cols
+    cols = c("#018571", "#80cdc1", "#f5f5f5", "#dfc27d", "#a6611a")
   )
-  grDevices::dev.off()
+  title(xlab = "Chromosome", ylab = expression(log[2] ~ "copy-number ratio"))
+  # Gain/loss threshold lines: neutral grey so they don't clash with the
+  # new teal/brown palette. Asymmetric — gain at +gain_threshold,
+  # loss at loss_threshold (already signed negative).
+  abline(h = c(loss_threshold, gain_threshold), lty = 2, col = "grey50")
+  dev.off()
   
   # Save segment results
   seg_file <- file.path(seg_dir, paste0(clean_sample_id, "_cnv_segments.seg"))
@@ -483,7 +601,7 @@ process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_d
     segments = segments_df,
     bins = cnv_bin,
     segments_file = seg_file,
-    plot_file = plot_file
+    plot_file = pdf_file
   )
 }
 
@@ -556,10 +674,29 @@ run_champ_cnv <- function(rgset, sample_info, references, plots_dir, seg_dir, th
 #' Generate CNV frequency plot
 #'
 #' @param segments Data frame with CNV segments
-#' @param threshold Threshold for calling gains/losses
+#' @param gain_threshold seg.mean cutoff above which a segment counts as a gain
+#' @param loss_threshold seg.mean cutoff below which a segment counts as a loss
+#'                       (signed; e.g. -0.2)
+#' @param threshold Deprecated. Legacy single absolute cutoff applied
+#'                  symmetrically; if supplied, overrides gain/loss defaults
+#'                  with ±abs(threshold). Kept for back-compat with callers
+#'                  that haven't been updated yet.
 #' @param output_dir Output directory for plots
 #' @return Path to frequency plot
-generate_cnv_frequency_plot <- function(segments, threshold = 0.18, output_dir = ".") {
+generate_cnv_frequency_plot <- function(segments,
+                                        gain_threshold =  0.15,
+                                        loss_threshold = -0.20,
+                                        threshold = NULL,
+                                        output_dir = ".") {
+
+  # Back-compat: if a caller passed the old single threshold, apply it
+  # symmetrically and ignore the gain/loss defaults.
+  if (!is.null(threshold)) {
+    gain_threshold <-  abs(threshold)
+    loss_threshold <- -abs(threshold)
+  }
+  gain_threshold <-  abs(gain_threshold)
+  loss_threshold <- -abs(loss_threshold)
   
   message("Generating CNV frequency plot...")
   
@@ -607,15 +744,24 @@ generate_cnv_frequency_plot <- function(segments, threshold = 0.18, output_dir =
     return(NULL)
   }
   
-  # Generate plot (PNG for direct HTML embedding)
-  png_path <- file.path(output_dir, "cnv_frequency_plot.png")
-  png(png_path, width = 12, height = 5, units = "in", res = 200)
-
-  freqplot(segments, threshold = threshold, plot.title = "CNV Frequency Plot")
-
+  # Generate plot
+  pdf_path <- file.path(output_dir, "cnv_frequency_plot.pdf")
+  pdf(pdf_path, width = 12, height = 5)
+  # Margins for the axis titles + tick labels freqplot draws (left: y-scale +
+  # "% of Gain or Loss"; bottom: chromosome numbers + "Chromosome").
+  par(mar = c(4, 5, 2, 2) + 0.1)
+  
+  # Call the freqplot function. plot.title = "" suppresses the on-plot title:
+  # the figure is always captioned by its filename or the report section around
+  # it, so the in-plot heading was redundant.
+  freqplot(segments,
+           gain_threshold = gain_threshold,
+           loss_threshold = loss_threshold,
+           plot.title = "")
+  
   dev.off()
-
-  return(png_path)
+  
+  return(pdf_path)
 }
 
 #' Source freqplot functions
@@ -623,10 +769,19 @@ generate_cnv_frequency_plot <- function(segments, threshold = 0.18, output_dir =
 #' This function sources the freqplot functions from the provided code
 source_freqplot_functions <- function() {
   
-  # Define the freqplot function and assign to global environment
-  freqplot <<- function(segs.data, threshold=0.18, plot.title="Copy Number Frequency") {
+  # Define the freqplot function and assign to global environment.
+  # gain_threshold / loss_threshold are asymmetric: a segment is a gain iff
+  # its seg.mean is strictly greater than gain_threshold, and a loss iff
+  # strictly less than loss_threshold (loss_threshold is signed negative).
+  freqplot <<- function(segs.data,
+                        gain_threshold =  0.15,
+                        loss_threshold = -0.20,
+                        plot.title = "Copy Number Frequency") {
+    gain_threshold <-  abs(gain_threshold)
+    loss_threshold <- -abs(loss_threshold)
+
     segs.mtx <- segs.as.mtx(segs.data, anns=NULL)
-    
+
     mean.pos.col <- which(colnames(segs.mtx) == "mean.pos")
     X <- as.matrix(segs.mtx[, -(1:mean.pos.col)])
     n.ints <- nrow(segs.mtx)
@@ -635,22 +790,19 @@ source_freqplot_functions <- function() {
     g.start <- c(0, cumsum(int.size[-n.ints]))
     g.end <- cumsum(int.size)
     n.subj <- ncol(X)
-    
+
     chr.num <- cumsum(c(1, segs.mtx$chrom[-1] != segs.mtx$chrom[-n.ints]))
     bg.col <- c("lightgray", "white")[chr.num %% 2 + 1]
-    
+
     nloss <- rep(0, n.ints)
     ngain <- rep(0, n.ints)
-    
+
     for(i in 1:n.subj) {
       seg.col <- bg.col
-      seg.call <- sign(X[, i]) * (abs(X[, i]) > abs(threshold))
-      seg.call[is.na(seg.call)] <- 0
-      
-      seg.loss <- (seg.call < 0)
+      vals <- X[, i]
+      seg.gain <- !is.na(vals) & vals > gain_threshold
+      seg.loss <- !is.na(vals) & vals < loss_threshold
       nloss <- nloss + seg.loss
-      
-      seg.gain <- (seg.call > 0)
       ngain <- ngain + seg.gain
     }
     
@@ -660,32 +812,61 @@ source_freqplot_functions <- function() {
     plot(c(0, g.end[n.ints]), c(-0.8, 0.8),  
          type="n", axes=FALSE,
          xlab="", ylab="")
-    axis(side=2, at=c(-1, -0.5, 0, 0.5, 1),
-         labels=c("100", "50", "0", "50", "100"), line=-1.8, las=1, cex=2.2)
-    
     rect(g.start, -1, g.end, 1, col=bg.col, border=bg.col)
+
+    # y-axis in the LEFT MARGIN (outside the panel) — drawn AFTER the grey
+    # chromosome rectangles so the tick labels are not painted over. The old
+    # code used line=-1.8 (inside the panel) and the rect() above hid it.
+    axis(side=2, at=c(-1, -0.5, 0, 0.5, 1),
+         labels=c("100", "50", "0", "50", "100"), las=1, cex.axis=0.9)
     
     rect(g.start, 0, g.end, 0 + (ngain/n.subj), col="#a6611a", border="#a6611a")
 
     rect(g.start, 0, g.end, 0 - (nloss/n.subj), col="#018571", border="#018571")
     
-    mtext(plot.title, side=3, at=g.end[n.ints]/2, cex=1.3)
-    mtext("% of Gain or Loss", side=2, at=0, cex=1.0)
-    
-    chr.start <- c(g.start[1], g.start[c(segs.mtx$chrom[-1] != segs.mtx$chrom[-n.ints])])
-    if (length(chr.start) >= 22) {
-      chr.start <- chr.start[-22]
+    if (!is.null(plot.title) && nzchar(plot.title)) {
+      mtext(plot.title, side=3, at=g.end[n.ints]/2, cex=1.3)
     }
-    
-    chr.end <- c(g.end[c(segs.mtx$chrom[-1] != segs.mtx$chrom[-n.ints])], g.end[n.ints])
-    if (length(chr.end) >= 22) {
-      chr.end <- chr.end[-22]
+    mtext("% of Gain or Loss", side=2, line=3, cex=1.0)
+
+    # Chromosome boundaries. `brk` holds the index of the last interval of each
+    # chromosome, so a chromosome spans g.start[brk_prev + 1] .. g.end[brk].
+    #
+    # The previous version indexed g.start with the raw logical vector
+    # (length n.ints - 1) rather than with the boundary positions, which
+    # selected the interval *before* each boundary and pulled every label left
+    # of its rectangle. Label positions are now derived from the interval
+    # ranges themselves, and the chromosome identity is read from the data
+    # instead of assuming a fixed c(1:21, "X", "Y") sequence -- the old
+    # hard-coded vector combined with a [-22] drop mislabelled every
+    # chromosome after 21 whenever X/Y were absent.
+    brk       <- which(segs.mtx$chrom[-1] != segs.mtx$chrom[-n.ints])
+    first.int <- c(1, brk + 1)
+    last.int  <- c(brk, n.ints)
+    chr.start <- g.start[first.int]
+    chr.end   <- g.end[last.int]
+
+    chr.codes  <- segs.mtx$chrom[first.int]
+    chr.labels <- ifelse(chr.codes == 23, "X",
+                  ifelse(chr.codes == 24, "Y", as.character(chr.codes)))
+
+    # Drop only labels that genuinely cannot fit: compare each label's rendered
+    # width against its rectangle. This keeps chr22 whenever there is room for
+    # it, rather than deleting position 22 unconditionally.
+    cex.chr  <- 0.6
+    mid      <- (chr.start + chr.end) / 2
+    box.w    <- chr.end - chr.start
+    lab.w    <- strwidth(chr.labels, cex = cex.chr)
+    show     <- lab.w <= box.w
+    if (any(!show)) {
+      message("freqplot: omitting cramped chromosome label(s): ",
+              paste(chr.labels[!show], collapse = ", "))
     }
-    
-    chr.labels <- c(1:21, "X", "Y")
-    chr.labels <- chr.labels[1:min(length(chr.start), length(chr.labels))]
-    
-    text((chr.start + chr.end)/2, -1.05, chr.labels, cex=0.6)
+    # Chromosome numbers + x-axis title in the BOTTOM MARGIN via mtext (at =
+    # user x-coord), which is clip-safe — the old text() at y=-1.05 sat below
+    # the plotted range and was cut off. Mirrors the genome plot's "Chromosome".
+    mtext(chr.labels[show], side = 1, at = mid[show], line = 0.3, cex = cex.chr)
+    mtext("Chromosome", side = 1, line = 1.8, cex = 1.0)
   }
   
   # Define supporting functions and assign to global environment
@@ -756,14 +937,13 @@ source_freqplot_functions <- function() {
     }
     
     # Remove rows with all NAs
-    # drop=FALSE keeps X as a matrix even when nsamp == 1
     all.na <- (rowSums(is.na(X)) == nsamp)
-    X <- X[!all.na, , drop = FALSE]
+    X <- X[!all.na, ]
     uniq.ints <- uniq.ints[!all.na, ]
     
     # Combine identical adjacent rows
     x.nints <- nrow(X)
-    x.chng <- rowSums(abs(X[-1, , drop = FALSE] - X[-x.nints, , drop = FALSE])) > 0
+    x.chng <- rowSums(abs(X[-1, ] - X[-x.nints, ])) > 0
     x.chng[is.na(x.chng)] <- TRUE
     chr.chng <- (uniq.ints[-1, 1] != uniq.ints[-x.nints, 1])
     new.row <- which(chr.chng | x.chng)
@@ -772,7 +952,7 @@ source_freqplot_functions <- function() {
     new.start <- uniq.ints[c(1, new.row + 1), 2]
     new.end <- uniq.ints[c(new.row, x.nints), 3]
     
-    X <- X[c(1, new.row + 1), , drop = FALSE]
+    X <- X[c(1, new.row + 1), ]
     new.ints <- cbind.data.frame(
       chrom = new.chr,
       loc.start = new.start,

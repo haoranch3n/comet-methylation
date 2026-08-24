@@ -120,9 +120,12 @@ filter_probes <- function(beta_values,
     # Honors the detection_p_threshold argument — was previously hardcoded 0.05.
     detection_p[detection_p > detection_p_threshold] <- NA
 
-    # Reorder samples to match beta_values column order.
-    # drop=FALSE prevents a 1-sample data.frame from collapsing to a vector.
-    detection_p <- detection_p[, match(colnames(beta_values), colnames(detection_p)), drop = FALSE]
+    # Reorder samples to match beta_values column order. drop = FALSE keeps a
+    # one-column data.frame as 2-D — when only a single sample passes QC,
+    # beta_values has one column and the default drop would collapse
+    # detection_p to a vector, breaking the apply() below.
+    detection_p <- detection_p[, match(colnames(beta_values), colnames(detection_p)),
+                               drop = FALSE]
 
     # min_sample_success_rate is the FRACTION OF SAMPLES that must succeed
     # for a probe to be kept. Remove probes where success rate < threshold,
@@ -156,7 +159,6 @@ filter_probes <- function(beta_values,
       ))
     }
     ## Now we can remove these probes from the beta table and the detection p-values
-    # drop=FALSE prevents a 1-column matrix from collapsing to a named vector.
     if (length(probes_to_remove) > 0){
       beta_v2.detP <- beta_values[-probes_to_remove, , drop = FALSE]
       pvals2 <- detection_p[-probes_to_remove, , drop = FALSE]
@@ -221,12 +223,12 @@ filter_probes <- function(beta_values,
     # Find which beta probes have matching base names in the keep list
     keep_indices <- beta_base_names %in% keep_base_names
     beta_values.clean <- beta_v2.detP[keep_indices, , drop = FALSE]
-    
+
     message(paste("EPICv2 probe matching: kept", sum(keep_indices), "out of", length(keep_indices), "probes"))
   } else {
     # For 450K and EPIC, use direct name matching with the extracted probe names
     beta_values.clean <- beta_v2.detP[rownames(beta_v2.detP) %in% keep.probes$x, , drop = FALSE]
-  } 
+  }
   
   
   # Output filtering statistics

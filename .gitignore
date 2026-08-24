@@ -1,5 +1,14 @@
-# Pipeline outputs
+# Pipeline outputs. `output/` is v1.1.4's default; the bare names below are the
+# per-step directories v3.0.0 writes when --output_dir points at the repo root.
 output/
+results*/
+processed_data/
+qc/
+dimensionality_reduction/
+cnv/
+figures/
+reports/
+hpc_scripts/
 
 # renv local package library (restore with renv::restore())
 renv/library/
@@ -12,13 +21,40 @@ renv/lock/
 # HPC / install logs
 *.out
 *.err
+*.log
 
 # Large proprietary / reference tarball (obtain separately; exceeds GitHub file size limit)
 yamapData*.tar
 yamapData*.tar.gz
+
+# Reference cohort data. Deliberately NOT vendored here: MeQTrack's sibling
+# reference/ directory carries COMET_Labkey_*.csv, which is patient-level
+# clinical metadata (subject IDs, names, ages, sex, diagnosis, site). It must
+# never reach GitHub. The GSE* t-SNE embeddings alongside it are public but are
+# left out too, so there is no half-populated reference/ to be mistaken for a
+# complete one. Pass --rp_reference_dir out of band to run reference_projection.
+reference/
+*Labkey*.csv
+*labkey*.csv
+
+# Reference snapshots built from patient betas (see comet-homepage-cloud).
+reference_snapshot*.rds
 
 # R / IDE
 .Rhistory
 .RData
 .Ruserdata
 .Rproj.user/
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+._.DS_Store
+._*
+Thumbs.db
+
+# Temporary files
+*~
+*.swp
+*.tmp

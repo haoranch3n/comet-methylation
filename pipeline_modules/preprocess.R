@@ -206,6 +206,150 @@ read_methylation_data <- function(sample_sheet, array_type = "auto") {
   return(rgset)
 }
 
+#' Compute per-sample GCT bisulfite-conversion control score
+#'
+#' GCT (Zhou et al. 2017) quantifies residual *incomplete* bisulfite
+#' conversion from the Infinium-I C/T-extension probes. A score near 1.0
+#' indicates complete conversion; higher values indicate more incomplete
+#' conversion. This is the specific QC metric sesame provides that minfi does
+#' not, and the reason preprocessing reads IDATs through sesame.
+#'
+#' sesame::bisConversionControl() auto-fetches the required extension probes
+#' only for EPIC and HM450 (450k). EPICv2/MSA need extR/extA supplied manually
+#' (Phase 2), so those array types return NA with an explanatory note rather
+#' than erroring. The metric is informational only — it never gates Pass_QC.
+#'
+#' @param basenames IDAT basename prefixes (sample_sheet$Basename)
+#' @param sample_ids Per-sample identifiers, aligned to basenames order
+#' @param array_type Array type ("450k", "EPIC", "EPICv2", ...)
+#' @param bpparam BiocParallel backend (reused from the caller)
+#' @return data.frame with Sample_ID, GCT_Score, Array_Type, Note (one row/sample)
+compute_gct_scores <- function(basenames, sample_ids, array_type, bpparam) {
+  at <- toupper(array_type)
+
+  # bisConversionControl auto-fetches its C/T-extension probes for EPIC/HM450
+  # only. For EPICv2 (no sesameData EPICv2.probeInfo) we supply extR/extA from a
+  # vendored probe list derived from the Zhou Lab EPICv2 manifest (type-I probes
+  # split by extension base: nextBase "R" -> ext-C, "A" -> ext-T). This was
+  # validated to reproduce sesame's native GCT exactly on EPIC. Other platforms
+  # (MSA, HM27) stay NA until their ext probes are sourced.
+  gct_func <- sesame::bisConversionControl
+  if (at == "EPICV2") {
+    ext <- load_epicv2_ext_probes()
+    if (is.null(ext)) {
+      message("EPICv2 GCT ext-probe list unavailable — emitting NA.")
+      return(data.frame(
+        Sample_ID  = sample_ids,
+        GCT_Score  = NA_real_,
+        Array_Type = array_type,
+        Note       = "GCT skipped: EPICv2 ext-probe list not found under Anno/EPICv2/",
+        stringsAsFactors = FALSE
+      ))
+    }
+    gct_func <- function(sdf) {
+      sesame::bisConversionControl(sdf, extR = ext$extC, extA = ext$extT)
+    }
+  } else if (!at %in% c("EPIC", "450K")) {
+    message("GCT bisulfite-conversion control not yet supported for array type '",
+            array_type, "' — emitting NA.")
+    return(data.frame(
+      Sample_ID  = sample_ids,
+      GCT_Score  = NA_real_,
+      Array_Type = array_type,
+      Note       = "GCT not yet supported for this array type",
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  message("Computing GCT bisulfite-conversion control scores...")
+  # prep = "C" (inferInfiniumIChannel) is the minimal prep bisConversionControl
+  # needs: it reads InfIR(sdf), which requires Infinium-I channel assignment.
+  # Heavier prep (noob/dyebias) would distort the raw extension-probe signal.
+  scores <- tryCatch(
+    sesame::openSesame(basenames, prep = "C",
+                       func = gct_func,
+                       BPPARAM = bpparam),
+    error = function(e) {
+      warning("GCT computation failed (", conditionMessage(e),
+              "); recording NA for all samples.")
+      NULL
+    }
+  )
+
+  if (is.null(scores)) {
+    return(data.frame(
+      Sample_ID  = sample_ids,
+      GCT_Score  = NA_real_,
+      Array_Type = array_type,
+      Note       = "GCT computation failed; see pipeline log",
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  # openSesame returns a named numeric vector (names = IDAT prefixes/basenames),
+  # in the same order as `basenames`. Align by position to sample_ids.
+  scores <- as.numeric(scores)
+  if (length(scores) != length(sample_ids)) {
+    warning("GCT score count (", length(scores), ") != sample count (",
+            length(sample_ids), "); results may be misaligned.")
+    length(scores) <- length(sample_ids)  # pad/truncate with NA to keep shape
+  }
+
+  data.frame(
+    Sample_ID  = sample_ids,
+    GCT_Score  = round(scores, 4),
+    Array_Type = array_type,
+    Note       = ifelse(is.na(scores), "GCT not computed for this sample", ""),
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Dye-bias Red/Green QQ plots (sesame) — one PNG per sample.
+#'
+#' sesame::sesameQC_plotRedGrnQQ draws a Red-vs-Green quantile-quantile plot
+#' that exposes dye bias: a strong departure from the diagonal means the two
+#' colour channels are imbalanced. Computed on the channel-inferred SigDF
+#' (prep = "C") — i.e. BEFORE the pipeline's dye-bias correction — so the plot
+#' shows the bias that downstream noob/dyeBiasNL then corrects.
+#'
+#' Writes one rasterized PNG per sample to figures/qc/dye_bias/<Sample_ID>.png
+#' (~40 KB each) rather than a single vector PDF: the QQ plots every address, so
+#' a vector page is ~1 MB and a 200-sample PDF would be hundreds of MB. The app
+#' shows them one at a time behind a sample selector. Each sample is wrapped so
+#' one unreadable IDAT can't abort the rest.
+#'
+#' @param basenames IDAT basenames (sample_sheet$Basename)
+#' @param sample_ids Per-sample IDs (drive the file names + titles)
+#' @param figures_qc_dir The run's figures/qc directory (dirs$figures_qc); PNGs
+#'   land in a dye_bias/ subfolder of it
+plot_dye_bias_qq <- function(basenames, sample_ids, figures_qc_dir) {
+  fig_dir <- file.path(figures_qc_dir, "dye_bias")
+  dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+  message("Plotting dye-bias R/G QQ (", length(basenames), " samples)...")
+  safe <- gsub("[^A-Za-z0-9._-]", "_", sample_ids)
+  n_ok <- 0L
+  for (i in seq_along(basenames)) {
+    png_path <- file.path(fig_dir, paste0(safe[i], ".png"))
+    ok <- tryCatch({
+      sdf <- sesame::inferInfiniumIChannel(sesame::readIDATpair(basenames[i]))
+      grDevices::png(png_path, width = 700, height = 700, res = 110)
+      tryCatch(
+        sesame::sesameQC_plotRedGrnQQ(sdf, main = paste0("R-G QQ: ", sample_ids[i])),
+        finally = grDevices::dev.off()
+      )
+      TRUE
+    }, error = function(e) {
+      warning("Dye-bias QQ failed for ", sample_ids[i], ": ", conditionMessage(e))
+      if (file.exists(png_path)) unlink(png_path)
+      FALSE
+    })
+    if (isTRUE(ok)) n_ok <- n_ok + 1L
+  }
+  message("Dye-bias QQ written for ", n_ok, "/", length(basenames),
+          " samples: figures/qc/dye_bias/")
+  invisible(fig_dir)
+}
+
 #' Preprocess methylation data
 #'
 #' @param sample_sheet Sample sheet data frame
@@ -214,7 +358,7 @@ read_methylation_data <- function(sample_sheet, array_type = "auto") {
 #' @param threads Number of CPU threads to use
 #' @param output_dir Output directory
 #' @return List containing preprocessed data
-preprocess_methylation <- function(sample_sheet, array_type = "auto", 
+preprocess_methylation <- function(sample_sheet, array_type = "auto",
                                    normalization = "swan", 
                                    threads = 6,
                                    output_dir = ".") {
@@ -266,8 +410,8 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   }
 
   ####If EPICv2, then use sesame to prepare idats and extract beta values
-  ## The prep = "CDPB" function will allow for technical corrections to be made.
-  ## Specifically, C = Infer infinium I channel, D = dyeBiasNL, B = Noob Normalisation
+  ## prep = "QCDB" applies these technical corrections (left-to-right):
+  ## Q = qualityMask, C = infer Infinium-I channel, D = dyeBiasNL, B = Noob.
   if (array_type == "EPICv2"){
     beta_v2 <- sesame::openSesame(sample_sheet$Basename, prep = "QCDB", platform= "EPICv2", func = getBetas, BPPARAM=bpparam,
                                   collapseToPfx = TRUE, collapseMethod = "mean")
@@ -275,14 +419,7 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   }else {
     beta_v2 <- sesame::openSesame(sample_sheet$Basename, prep = "QCDB", func = getBetas, BPPARAM=bpparam)
   }
-  # openSesame returns a named vector (not matrix) for a single sample;
-  # coerce to a single-column matrix so downstream [, ...] indexing is safe.
-  if (is.null(dim(beta_v2))) {
-    beta_v2 <- matrix(beta_v2, ncol = 1,
-                      dimnames = list(names(beta_v2),
-                                      basename(sample_sheet$Basename[1])))
-  }
-  beta <- beta_v2[, match(sample_sheet$Sentrix_ID, colnames(beta_v2)), drop = FALSE]
+  beta <- beta_v2[, match(sample_sheet$Sentrix_ID, colnames(beta_v2))]
   message("Number of rows in beta: ", nrow(beta))
 
   ## openSesame(..., func = pOOBAH) doesn't accept collapseToPfx /
@@ -292,18 +429,6 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   ## match beta's per-CpG space for EPICv2.
   detection_p <- sesame::openSesame(sample_sheet$Basename, func = pOOBAH,
                                     return.pval = TRUE, BPPARAM = bpparam)
-
-  # Single-sample openSesame returns a named vector (no dim / rownames).
-  # Coerce to a 1-column matrix BEFORE the EPICv2 replicate-collapse below,
-  # which keys off rownames(). Otherwise, for single-sample EPICv2 uploads,
-  # beta gets collapsed to per-CpG IDs (collapseToPfx=TRUE) while detection_p
-  # keeps the _TC/_BC replicate suffixes, and filter_probes sees 0 shared
-  # probes ("Probe-name mismatch ... share 0 probe IDs").
-  if (is.null(dim(detection_p))) {
-    detection_p <- matrix(detection_p, ncol = 1,
-                          dimnames = list(names(detection_p),
-                                          basename(sample_sheet$Basename[1])))
-  }
 
   if (array_type == "EPICv2" &&
       any(grepl("_(BC|TC)\\d+$", utils::head(rownames(detection_p), 200)))) {
@@ -326,51 +451,60 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
             nrow(detection_p), " x ", ncol(detection_p))
   }
 
-  # (detection_p was already coerced to a matrix above, before the collapse.)
   detection_p_df = as.data.frame(detection_p)
-  detection_p_df <- detection_p_df[, match(sample_sheet$Sentrix_ID, colnames(detection_p_df)), drop = FALSE]
+  detection_p_df <- detection_p_df[, match(sample_sheet$Sentrix_ID, colnames(detection_p_df))]
   message("Number of rows in detection_p: ", nrow(detection_p)) 
   
   # Add predicted sex
-  # getSex uses k-means with 2 centers; this fails when n_samples < 2 or
-  # the Y-chromosome signal is constant (e.g. all-female or single sample).
-  # Catch and fall back to NA predictions in those cases.
   message("Predicting sex based on methylation patterns...")
-  pred_sex <- NULL
+  pred_sex <- NULL 
   mset_raw <- preprocessRaw(rgset)
   gset <- mapToGenome(mset_raw)
-  pred_sex <- tryCatch(
-    getSex(gset),
-    error = function(e) {
-      warning("getSex failed (likely single sample or non-distinct centers): ", conditionMessage(e),
-              " -- sex prediction set to NA.")
-      n <- ncol(gset)
-      data.frame(predictedSex = rep(NA_character_, n),
-                 xMed = rep(NA_real_, n), yMed = rep(NA_real_, n),
-                 row.names = colnames(gset))
-    }
-  )
+  pred_sex <- getSex(gset)
 
-  # Extract predicted sex values from S4 object
+  # Extract predicted sex values from S4 object. Also keep the X/Y median
+  # intensities (xMed/yMed, log2) — they drive minfi's call and, retained here,
+  # let the karyotype step flag Loss-of-Y (single X by methylation but depleted
+  # Y intensity, common in tumours) instead of discarding them.
   if (is(pred_sex, "DataFrame") || is(pred_sex, "data.frame")) {
-    sample_info$pred_sex <- as.character(pred_sex$predictedSex)
+    sample_info$pred_sex   <- as.character(pred_sex$predictedSex)
+    sample_info$Minfi_xMed <- as.numeric(pred_sex$xMed)
+    sample_info$Minfi_yMed <- as.numeric(pred_sex$yMed)
   } else {
     sample_info$pred_sex <- as.character(pred_sex)
   }
-  rm(mset_raw, gset, pred_sex)
-  gc()
 
   fwrite(detection_p_df, file=file.path(output_dir, "detection_p.txt"), row.names=TRUE, sep="\t")
+  m_values = BetaValueToMValue(beta)
+
+  # Resolve the concrete array type once (the param may still be "auto").
+  resolved_array_type <- if (array_type == "auto") determine_array_type(rgset) else array_type
+
+  # GCT bisulfite-conversion control (sesame). Aligned to sample_info$Sample_ID
+  # (= Sentrix_ID), the same per-sample identifier used elsewhere. Wrapped so a
+  # GCT failure can never break preprocessing.
+  gct <- tryCatch(
+    compute_gct_scores(sample_sheet$Basename, sample_info$Sample_ID,
+                       resolved_array_type, bpparam),
+    error = function(e) {
+      warning("compute_gct_scores() errored (", conditionMessage(e),
+              "); skipping GCT table.")
+      NULL
+    }
+  )
+
   message("Done Preprocessing!")
   write.table(sample_info, file=file.path(output_dir, "sample_info.txt"), row.names=TRUE, sep="\t")
 
-  # Create result object (m_values omitted — compute on demand if needed downstream)
+  # Create result object
   result <- list(
     rgset = rgset,
     beta = beta,
+    m_values = m_values,
     detection_p = detection_p_df,
     sample_info = sample_info,
-    array_type = if (array_type == "auto") determine_array_type(rgset) else array_type,
+    gct = gct,
+    array_type = resolved_array_type,
     normalization = normalization
     )
 

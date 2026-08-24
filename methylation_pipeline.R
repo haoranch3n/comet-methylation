@@ -22,7 +22,7 @@ rm(list=ls())
 # Process command line arguments
 suppressPackageStartupMessages(library(optparse))
 
-MEQTRACK_VERSION <- "1.1.4"
+MEQTRACK_VERSION <- "3.0.0"
 
 cat("┌───────────────────────────────────────────────────┐\n")
 cat("│                     MeQTrack                      │\n")
@@ -35,7 +35,7 @@ option_list <- list(
   make_option(c("-c", "--config"), type="character", default=NULL,
               help="Configuration file path", metavar="file"),
   make_option(c("-s", "--step"), type="character", default="all",
-              help="Pipeline step to run [all|preprocess|qc|dim_reduction|cnv|visualization]", 
+              help="Pipeline step to run [all|preprocess|qc|filtering|dim_reduction|reference_projection|deconvolution|cnv|visualization|merge]",
               metavar="step"),
   make_option(c("-a", "--array_type"), type="character", default="auto",
               help="Array type [450k|EPIC|EPICv2|auto]", metavar="type"),
@@ -49,8 +49,33 @@ option_list <- list(
               help="Path to sample sheet CSV file", metavar="file"),
   make_option("--hpc", action="store_true", default=FALSE,
               help="Generate HPC submission scripts"),
-  make_option("--disable_cnv", action="store_true", default=FALSE,
-              help="Skip CNV analysis entirely (omits conumee2/yamapData loading; overrides --step all)")
+  # --- cross-platform merging (--step merge) ---------------------------------
+  make_option("--merge_sources", type="character", default=NULL,
+              help=paste("Completed per-platform run directories to merge, as",
+                         "PLATFORM=DIR pairs separated by commas, e.g.",
+                         "'EPIC=/runs/epic,EPICv2=/runs/epicv2'. Required for",
+                         "--step merge."),
+              metavar="pairs"),
+  make_option("--merge_which", type="character", default="raw",
+              help="Which beta matrix to merge [raw|filtered] (default raw)",
+              metavar="which"),
+  make_option("--batch_correct", action="store_true", default=FALSE,
+              help=paste("Apply ComBat platform batch correction to the merged",
+                         "cohort, writing beta_values_combat.txt.gz alongside",
+                         "the uncorrected matrix. Diagnostics are reported",
+                         "either way.")),
+  make_option("--batch_covariates", type="character", default=NULL,
+              help=paste("Comma-separated sample_info columns to protect from",
+                         "ComBat (e.g. 'Group'). Omit for a single-group",
+                         "cohort. A covariate collinear with platform is not",
+                         "identifiable."),
+              metavar="cols"),
+  make_option("--cnv_references", type="character", default=NULL,
+              help=paste("Sample sheet of control IDATs for the CNV step.",
+                         "Overrides the prepared per-platform reference in",
+                         "Anno/<platform>/. When neither is present the",
+                         "yamapData internal EPIC reference is used."),
+              metavar="file")
 )
 
 opt_parser <- OptionParser(
@@ -60,9 +85,31 @@ opt_parser <- OptionParser(
 )
 opt <- parse_args(opt_parser)
 
+# Resolve --input and --output to absolute paths against the directory the
+# user invoked Rscript from, BEFORE the setwd() below moves the working
+# directory into pipeline/. Without this a repo-root-relative path is
+# re-resolved against pipeline/ and lands in the wrong place.
+# normalizePath() alone is not enough: for a path that does not exist yet
+# (the usual --output case) it returns the path unchanged and still
+# relative — so we prepend the invocation directory ourselves for any
+# non-absolute path. Absolute paths (e.g. those the Shiny bridge passes)
+# are only normalised.
+.abs_path <- function(p) {
+  if (is.null(p)) return(p)
+  is_abs <- grepl("^(/|[A-Za-z]:[\\\\/]|\\\\\\\\)", p)
+  if (!is_abs) p <- file.path(getwd(), p)
+  normalizePath(p, winslash = "/", mustWork = FALSE)
+}
+opt$input  <- .abs_path(opt$input)
+opt$output <- .abs_path(opt$output)
 
 
-# Load necessary libraries (CNV-specific packages loaded lazily inside the CNV block)
+# Load necessary libraries.
+# conumee2 + yamapData are attached lazily inside run_conumee_cnv() (in
+# pipeline_modules/cnv_analysis.R) — only the CNV step needs them, and
+# attaching them here would make non-CNV steps (preprocess/QC/dim-reduction)
+# fail to start when conumee2 isn't installed. The CNV step still hard-fails
+# loudly via its own requireNamespace check.
 suppressPackageStartupMessages({
   library(data.table)
   library(limma)
@@ -101,9 +148,13 @@ source("pipeline_modules/preprocess.R")
 source("pipeline_modules/qc.R")
 source("pipeline_modules/filtering.R")
 source("pipeline_modules/dim_reduction.R")
+source("pipeline_modules/reference_projection.R")
+source("pipeline_modules/deconvolution.R")
 source("pipeline_modules/cnv_analysis.R")
 source("pipeline_modules/visualization.R")
 source("pipeline_modules/hpc.R")
+source("pipeline_modules/array_detect.R")
+source("pipeline_modules/merge_platforms.R")
 
 # Set up pipeline variables
 cat("Setting up methylation array analysis pipeline...\n")
@@ -117,12 +168,6 @@ if (!is.null(opt$config)) {
 } else {
   config <- default_config()
 }
-
-# --disable_cnv CLI flag overrides config$cnv$enabled
-if (isTRUE(opt$disable_cnv)) {
-  config$cnv$enabled <- FALSE
-}
-run_cnv <- isTRUE(config$cnv$enabled)
 
 # Override sample_sheet path if provided via command line
 if (!is.null(opt$input)) {
@@ -148,9 +193,170 @@ log_message(paste("Array type:", opt$array_type), log_file)
 log_message(paste("Probe directory:", opt$data_dir), log_file)
 log_message(paste("Threads:", opt$threads), log_file)
 
+# --- run provenance: record exactly what was chosen, in the run folder ------
+# Everything above/here goes to <run>/pipeline_log.txt via log_message, so a
+# folder is self-describing: which sheet, which step, which code version.
+log_message(paste("Step:", opt$step), log_file)
+log_message(paste("Input samplesheet:", opt$input), log_file)
+if (!is.null(opt$config))         log_message(paste("Config file:", opt$config), log_file)
+if (!is.null(opt$cnv_references)) log_message(paste("CNV references (explicit):", opt$cnv_references), log_file)
+git_head <- suppressWarnings(tryCatch(
+  system2("git", c("rev-parse", "--short", "HEAD"), stdout = TRUE, stderr = FALSE),
+  error = function(e) character(0)))
+git_branch <- suppressWarnings(tryCatch(
+  system2("git", c("rev-parse", "--abbrev-ref", "HEAD"), stdout = TRUE, stderr = FALSE),
+  error = function(e) character(0)))
+if (length(git_head)) log_message(paste0("Code version: ", paste(git_branch, collapse = ""),
+                                         " @ ", paste(git_head, collapse = "")), log_file)
+log_message(paste("R:", R.version.string), log_file)
+
 if (opt$hpc) {
   log_message("Generating HPC submission scripts", log_file)
   generate_hpc_scripts(config, opt, main_dir)
+  quit(save = "no", status = 0)
+}
+
+# ---------------------------------------------------------------------------
+# Cross-platform merge (--step merge)
+#
+# Runs before run_pipeline() because it consumes completed per-platform run
+# directories rather than a sample sheet: platforms must be preprocessed
+# separately (minfi's read.metharray.exp(force = TRUE) silently truncates to
+# the smallest common probe set when IDAT sizes differ), so there is nothing
+# for a single mixed run to do upstream of beta values.
+#
+# Any mix of 450K / EPIC / EPICv2 is supported, and so is more than two
+# platforms at once. Expected intersections, from the manifests:
+#   450K+EPIC 452K, 450K+EPICv2 394K, EPIC+EPICv2 721K, all three 370K --
+# all far above the ~10K probes dimensionality reduction actually uses.
+#
+# Writes a merged tree that the ordinary dim_reduction / reference_projection /
+# cnv steps can then be pointed at with -o, unchanged.
+# ---------------------------------------------------------------------------
+
+#' Parse --merge_sources "EPIC=/a,EPICv2=/b" into a named character vector.
+parse_merge_sources <- function(spec) {
+  if (is.null(spec) || !nzchar(spec)) {
+    stop("--step merge requires --merge_sources 'PLATFORM=DIR,PLATFORM=DIR'.")
+  }
+  parts <- trimws(strsplit(spec, ",", fixed = TRUE)[[1]])
+  parts <- parts[nzchar(parts)]
+  if (!length(parts)) stop("--merge_sources is empty.")
+
+  kv <- regmatches(parts, regexec("^([^=]+)=(.+)$", parts))
+  bad <- vapply(kv, function(m) length(m) != 3L, logical(1))
+  if (any(bad)) {
+    stop("--merge_sources entries must be PLATFORM=DIR; malformed: ",
+         paste(parts[bad], collapse = ", "))
+  }
+  labels <- trimws(vapply(kv, `[`, character(1), 2L))
+  paths  <- trimws(vapply(kv, `[`, character(1), 3L))
+
+  # Normalise labels so 'epicv2', 'EPIC_v2' and '450k' agree with the rest of
+  # the pipeline, but keep an unrecognised label rather than dropping the
+  # source -- the user may be merging something we don't know about.
+  canon <- canonical_array_type(labels)
+  labels <- ifelse(is.na(canon), labels, canon)
+  if (anyDuplicated(labels)) {
+    stop("Duplicate platform label(s) in --merge_sources: ",
+         paste(unique(labels[duplicated(labels)]), collapse = ", "))
+  }
+  stats::setNames(paths, labels)
+}
+
+run_merge_step <- function() {
+  log_message("Step: merging per-platform runs into one cohort", log_file)
+  sources <- parse_merge_sources(opt$merge_sources)
+  log_message(paste("Merge sources:",
+                    paste(sprintf("%s=%s", names(sources), sources),
+                          collapse = ", ")), log_file)
+
+  res <- merge_platforms(sources, output_dir = main_dir,
+                         policy = "intersection", which = opt$merge_which)
+  log_message(sprintf("Merged cohort: %d probes x %d samples",
+                      nrow(res$beta), ncol(res$beta)), log_file)
+
+  si <- res$sample_info
+  platform <- si$Platform[match(colnames(res$beta), si$Sample_ID)]
+
+  # Always report how strongly platform structures the merged cohort, whether
+  # or not we are about to correct it. pred_sex, when present, doubles as a
+  # biological negative control: correction should leave it detectable.
+  control <- if ("pred_sex" %in% names(si)) {
+    si$pred_sex[match(colnames(res$beta), si$Sample_ID)]
+  } else NULL
+
+  diag_before <- tryCatch(
+    platform_batch_diagnostics(res$beta, platform, control = control),
+    error = function(e) {
+      log_message(paste("Batch diagnostics skipped:", conditionMessage(e)),
+                  log_file)
+      NULL
+    })
+  if (!is.null(diag_before)) {
+    log_message(sprintf(
+      "Platform effect before correction: p(PC1)=%.3g p(PC2)=%.3g, corr gap %+.4f",
+      diag_before$p_platform[1], diag_before$p_platform[2],
+      diag_before$corr_gap), log_file)
+    if (!opt$batch_correct && diag_before$corr_gap > 0.05) {
+      log_message(paste("NOTE: samples resemble their platform-mates more than",
+                        "other samples. Consider --batch_correct."), log_file)
+    }
+  }
+
+  if (opt$batch_correct) {
+    covars <- NULL
+    if (!is.null(opt$batch_covariates) && nzchar(opt$batch_covariates)) {
+      cols <- trimws(strsplit(opt$batch_covariates, ",", fixed = TRUE)[[1]])
+      cols <- cols[nzchar(cols)]
+      missing_cols <- setdiff(cols, names(si))
+      if (length(missing_cols)) {
+        stop("--batch_covariates column(s) not in merged sample_info: ",
+             paste(missing_cols, collapse = ", "),
+             ". Available: ", paste(names(si), collapse = ", "))
+      }
+      covars <- si[match(colnames(res$beta), si$Sample_ID), cols, drop = FALSE]
+      log_message(paste("Protecting covariate(s) from ComBat:",
+                        paste(cols, collapse = ", ")), log_file)
+    }
+
+    cc <- correct_platform_batch(res$beta, platform, covariates = covars)
+    out_path <- file.path(dirs$processed, "beta_values_combat.txt.gz")
+    con <- gzfile(out_path, "w")
+    utils::write.table(
+      data.frame(ProbeID = rownames(cc$beta), cc$beta, check.names = FALSE),
+      con, sep = "\t", quote = FALSE, row.names = FALSE)
+    close(con)
+    log_message(sprintf("Batch-corrected betas written: %s (%d probes)",
+                        out_path, nrow(cc$beta)), log_file)
+
+    diag_after <- tryCatch(
+      platform_batch_diagnostics(cc$beta, platform, control = control),
+      error = function(e) NULL)
+    if (!is.null(diag_after)) {
+      log_message(sprintf(
+        "Platform effect after correction: p(PC1)=%.3g p(PC2)=%.3g, corr gap %+.4f",
+        diag_after$p_platform[1], diag_after$p_platform[2],
+        diag_after$corr_gap), log_file)
+      if (!is.null(control) && !is.na(diag_after$p_control[2])) {
+        log_message(sprintf(
+          "Control signal (pred_sex) after correction: p(PC1)=%.3g p(PC2)=%.3g",
+          diag_after$p_control[1], diag_after$p_control[2]), log_file)
+      }
+      if (!is.null(diag_before) && diag_after$corr_gap > diag_before$corr_gap) {
+        warning("ComBat did not reduce the within/between-platform correlation ",
+                "gap; inspect the diagnostics before using the corrected matrix.")
+      }
+    }
+  }
+
+  log_message("Merge step complete.", log_file)
+  invisible(res)
+}
+
+if (opt$step == "merge") {
+  run_merge_step()
+  log_message(paste("Merged output written to:", main_dir), log_file)
   quit(save = "no", status = 0)
 }
 
@@ -183,16 +389,40 @@ run_pipeline <- function(step) {
     
     # Extract key components
     beta_values <- result$beta
+    m_values <- result$m_values
     rgset <- result$rgset
     sample_info <- result$sample_info
     detection_p <- result$detection_p
     array_type <- result$array_type
-    
+    gct_table <- result$gct
+
     # Save beta values as a flat file
     write_beta_values(beta_values, file.path(dirs$processed, "beta_values.txt"))
-  } 
-  else {
-    # Load preprocessed data if not running preprocessing
+
+    # Save the GCT bisulfite-conversion control table (sesame) as its own
+    # standalone QC table. Informational only — does not affect Pass_QC.
+    if (!is.null(result$gct)) {
+      write.csv(result$gct,
+                file.path(dirs$qc, "conversion_qc.csv"),
+                row.names = FALSE)
+      log_message("Conversion QC (GCT) saved: conversion_qc.csv", log_file)
+    }
+
+    # Dye-bias Red/Green QQ plots (sesame), one PNG per sample under
+    # figures/qc/dye_bias/. Driver-side so it lands in the run's figures dir
+    # (dirs$figures_qc), not the processed_data dir. tryCatch so a plotting
+    # failure can never break the run.
+    tryCatch(
+      plot_dye_bias_qq(sample_sheet$Basename, sample_info$Sample_ID,
+                       dirs$figures_qc),
+      error = function(e) log_message(
+        paste("Dye-bias QQ plotting skipped:", conditionMessage(e)), log_file)
+    )
+  }
+  else if (step != "reference_projection") {
+    # Load preprocessed data if not running preprocessing.
+    # The reference-projection step is self-contained — it reads IDATs and
+    # SWAN-normalises them itself — so it does not need preprocessed data.
     log_message("Loading preprocessed data...", log_file)
     data_file <- file.path(dirs$processed, "preprocessed_data.RData")
     if (!file.exists(data_file)) {
@@ -219,11 +449,13 @@ run_pipeline <- function(step) {
       
       # Extract key components
       beta_values <- result$beta
+      m_values <- result$m_values
       rgset <- result$rgset
       sample_info <- result$sample_info
       detection_p <- result$detection_p
       array_type <- result$array_type
-      
+      gct_table <- result$gct
+
       # Debug: Check if rgset exists
       if (is.null(rgset)) {
         message("WARNING: rgset is NULL in preprocessed data. Some analyses may not work properly.")
@@ -252,7 +484,12 @@ run_pipeline <- function(step) {
     sample_detection_p_threshold   <- 0.05   # Default value
     failed_probe_percent_threshold <- 25     # Default value
     min_median_intensity           <- 10.5   # Default value
+    max_gct_score                  <- 1.3    # GCT bisulfite-conversion fail cutoff
     filter_failed_samples          <- TRUE   # Default value
+
+    # GCT table may be absent (old preprocessed data, or qc step run in
+    # isolation before this version). NULL disables GCT gating gracefully.
+    if (!exists("gct_table")) gct_table <- NULL
 
     if (!is.null(config$qc)) {
       if (!is.null(config$qc$detection_p_threshold))
@@ -263,6 +500,8 @@ run_pipeline <- function(step) {
         failed_probe_percent_threshold <- config$qc$failed_probe_percent_threshold
       if (!is.null(config$qc$min_median_intensity))
         min_median_intensity <- config$qc$min_median_intensity
+      if (!is.null(config$qc$max_gct_score))
+        max_gct_score <- config$qc$max_gct_score
       if (!is.null(config$qc$filter_failed_samples))
         filter_failed_samples <- config$qc$filter_failed_samples
     }
@@ -275,6 +514,9 @@ run_pipeline <- function(step) {
       sample_detection_p_threshold   = sample_detection_p_threshold,
       failed_probe_percent_threshold = failed_probe_percent_threshold,
       min_median_intensity           = min_median_intensity,
+      gct                            = gct_table,
+      max_gct_score                  = max_gct_score,
+      array_type                     = array_type,
       output_dir = dirs$qc,
       plots_dir  = dirs$figures_qc
     )
@@ -291,8 +533,10 @@ run_pipeline <- function(step) {
                             paste(qc_results$failed_samples, collapse = ", ")),
                     log_file)
 
-        # Filter beta matrix
+        # Filter beta and M-value matrices
         beta_values <- beta_values[, colnames(beta_values) %in% passed_samples, drop = FALSE]
+        if (!is.null(m_values))
+          m_values <- m_values[, colnames(m_values) %in% passed_samples, drop = FALSE]
 
         # Filter RGChannelSet (enables downstream use of rgset with QC-passed samples)
         if (!is.null(rgset))
@@ -308,6 +552,7 @@ run_pipeline <- function(step) {
       # Save filtered data
       filtered_result <- list(
         beta        = beta_values,
+        m_values    = m_values,
         sample_info = sample_info
       )
       save(filtered_result, file = file.path(dirs$processed, "filtered_data.RData"))
@@ -420,18 +665,10 @@ run_pipeline <- function(step) {
     write_beta_values(filtered_beta, file.path(dirs$processed, "filtered_beta_values.txt"))
     
     log_message(paste("Filtering complete. Kept", nrow(filtered_beta), "probes."), log_file)
-
-    # Free large upstream objects no longer needed.
-    # rgset is kept only when the CNV step will actually run (it is the sole
-    # consumer of rgset downstream).
-    if (!run_cnv) {
-      if (exists("rgset")) { rm(rgset); rgset <- NULL }
-    }
-    if (exists("beta_values"))  rm(beta_values)
-    if (exists("detection_p"))  rm(detection_p)
-    gc()
-  } else if (step != "preprocess" && step != "qc") {
-    # Try to load filtered data if not running filtering
+  } else if (step != "preprocess" && step != "qc" && step != "reference_projection" &&
+             step != "deconvolution") {
+    # Try to load filtered data if not running filtering. Deconvolution (like
+    # reference_projection) works off the raw RGChannelSet, not filtered betas.
     log_message("Loading filtered beta values...", log_file)
     filtered_file <- file.path(dirs$processed, "filtered_beta_values.txt")
     
@@ -563,12 +800,104 @@ run_pipeline <- function(step) {
     save(dim_reduction_results, file = file.path(dirs$dim_reduction, "dim_reduction_results.RData"))
   }
   
-  if ((step == "all" || step == "cnv") && run_cnv) {
-    # Load CNV-specific packages here (not at startup) to keep memory low when CNV is disabled
-    suppressPackageStartupMessages({
-      library(conumee2)
-      library(yamapData)
-    })
+  if (step == "all" || step == "reference_projection") {
+    # No "Step N:" prefix — the run_controller's stage-progress parser does
+    # not yet know about this stage (UI integration is a later roadmap item).
+    # Until then it logs as a plain stage, like probe filtering.
+    log_message("Reference projection", log_file)
+
+    # Reference-projection parameters (config$reference_projection$*).
+    rp_enabled       <- TRUE
+    rp_dataset       <- "COMET_1915"
+    rp_reference_dir <- "../reference"
+    rp_perplexity    <- 5
+    rp_knn_k         <- 25
+
+    if (!is.null(config$reference_projection)) {
+      if (!is.null(config$reference_projection$enabled))
+        rp_enabled <- config$reference_projection$enabled
+      if (!is.null(config$reference_projection$dataset))
+        rp_dataset <- config$reference_projection$dataset
+      if (!is.null(config$reference_projection$reference_dir))
+        rp_reference_dir <- config$reference_projection$reference_dir
+      if (!is.null(config$reference_projection$perplexity))
+        rp_perplexity <- config$reference_projection$perplexity
+      if (!is.null(config$reference_projection$knn_k))
+        rp_knn_k <- config$reference_projection$knn_k
+    }
+
+    # cwd is the pipeline/ directory (set above), so a relative reference_dir
+    # such as "../reference" resolves to the repo-root reference/ folder.
+    rp_reference_dir <- normalizePath(rp_reference_dir, mustWork = FALSE)
+
+    if (!rp_enabled) {
+      log_message("Reference projection disabled in config — skipping.", log_file)
+    } else if (!dir.exists(rp_reference_dir)) {
+      log_message(paste("Reference data directory not found — skipping projection:",
+                        rp_reference_dir), log_file)
+    } else {
+      # Self-contained: run_reference_projection() reads the query IDATs and
+      # SWAN-normalises them itself (matching how the reference embedding was
+      # built), so it does not depend on the preprocess step's output.
+      # Wrapped in tryCatch so a projection failure (e.g. the reference beta
+      # matrix not yet downloaded) does not abort the rest of the pipeline.
+      rp_result <- tryCatch(
+        run_reference_projection(
+          samplesheet   = sample_sheet,
+          dataset       = rp_dataset,
+          reference_dir = rp_reference_dir,
+          output_dir    = dirs$reference_projection,
+          perplexity    = rp_perplexity,
+          knn_k         = rp_knn_k
+        ),
+        error = function(e) {
+          log_message(paste("Reference projection failed:", conditionMessage(e)),
+                      log_file)
+          NULL
+        }
+      )
+      if (!is.null(rp_result)) {
+        save(rp_result,
+             file = file.path(dirs$reference_projection,
+                              "reference_projection_results.RData"))
+        log_message(sprintf(
+          "Reference projection complete: %d sample(s) projected onto '%s'.",
+          nrow(rp_result$projected), rp_dataset), log_file)
+      }
+    }
+  }
+
+  # Cell-type deconvolution (deconvMe) — OPT-IN standalone step, deliberately
+  # NOT part of "all" (heavy/optional deps; tumour-specific relevance). Works off
+  # the reloaded RGChannelSet; never gates Pass_QC.
+  if (step == "deconvolution") {
+    log_message("Cell-type deconvolution (deconvMe)", log_file)
+
+    dc_methods <- c("epidish", "houseman")
+    if (!is.null(config$deconvolution) && !is.null(config$deconvolution$methods)) {
+      dc_methods <- config$deconvolution$methods
+    }
+
+    dc_result <- tryCatch(
+      run_deconvolution(
+        rgset      = rgset,
+        array_type = array_type,
+        methods    = dc_methods,
+        output_dir = dirs$deconv
+      ),
+      error = function(e) {
+        log_message(paste("Deconvolution failed:", conditionMessage(e)), log_file)
+        NULL
+      }
+    )
+    if (!is.null(dc_result)) {
+      log_message(sprintf(
+        "Deconvolution complete: cell_fractions.csv written (%d rows).",
+        nrow(dc_result)), log_file)
+    }
+  }
+
+  if (step == "all" || step == "cnv") {
     log_message("Step 4: Copy number variation analysis", log_file)
     
     # Ensure array_type is available for CNV analysis
@@ -585,17 +914,28 @@ run_pipeline <- function(step) {
       }
     }
     
-    # Get CNV parameters
-    cnv_method <- "conumee"  # Default value
-    cnv_threshold <- 0.18  # Default value
-    cnv_frequency_plot <- TRUE  # Default value
-    
+    # Get CNV parameters. Asymmetric gain/loss thresholds; a legacy
+    # `threshold` key (older run_manifest.json files) still works and is
+    # applied symmetrically as ±abs(threshold).
+    cnv_method <- "conumee"
+    cnv_gain_threshold <-  0.15
+    cnv_loss_threshold <- -0.20
+    cnv_frequency_plot <- TRUE
+
     if (!is.null(config$cnv)) {
       if (!is.null(config$cnv$method)) {
         cnv_method <- config$cnv$method
       }
+      # Legacy single threshold (back-compat) — overridden by gain/loss below.
       if (!is.null(config$cnv$threshold)) {
-        cnv_threshold <- config$cnv$threshold
+        cnv_gain_threshold <-  abs(config$cnv$threshold)
+        cnv_loss_threshold <- -abs(config$cnv$threshold)
+      }
+      if (!is.null(config$cnv$gain_threshold)) {
+        cnv_gain_threshold <- abs(config$cnv$gain_threshold)
+      }
+      if (!is.null(config$cnv$loss_threshold)) {
+        cnv_loss_threshold <- -abs(config$cnv$loss_threshold)
       }
       if (!is.null(config$cnv$frequency_plot)) {
         cnv_frequency_plot <- config$cnv$frequency_plot
@@ -612,6 +952,33 @@ run_pipeline <- function(step) {
       references <- NULL
     }
     
+    # Record the CNV settings + which reference/controls will be used, so the
+    # run folder's pipeline_log.txt shows it (run_conumee_cnv itself only uses
+    # message(), which never reaches the log file).
+    log_message(paste("CNV method:", cnv_method), log_file)
+    log_message(sprintf("CNV thresholds: gain +%.2f / loss %.2f",
+                        cnv_gain_threshold, cnv_loss_threshold), log_file)
+    if (!is.null(references)) {
+      log_message("CNV reference: explicit reference samplesheet (--cnv_references)", log_file)
+    } else {
+      prepared_ref <- tryCatch(find_cnv_control_reference(array_type),
+                               error = function(e) NULL)
+      ref_meta <- if (!is.null(prepared_ref))
+        tryCatch(readRDS(prepared_ref)$meta, error = function(e) NULL) else NULL
+      if (!is.null(ref_meta)) {
+        log_message(sprintf("CNV reference: prepared %s controls at %s (%d samples, built %s)",
+                            ref_meta$platform, prepared_ref, ref_meta$n_samples,
+                            ref_meta$built), log_file)
+        if (length(ref_meta$excluded))
+          log_message(paste("  controls excluded (non-flat / low-correlation):",
+                            paste(ref_meta$excluded, collapse = ", ")), log_file)
+      } else if (!is.null(prepared_ref)) {
+        log_message(paste("CNV reference: prepared controls at", prepared_ref), log_file)
+      } else {
+        log_message("CNV reference: internal yamapData EPIC panel (fallback)", log_file)
+      }
+    }
+
     # Run CNV analysis
     cnv_results <- run_cnv_analysis(
       rgset,
@@ -621,21 +988,18 @@ run_pipeline <- function(step) {
       array_type = array_type,
       output_dir = dirs$cnv,
       plots_dir  = dirs$figures_cnv,
-      threads = opt$threads
+      threads = opt$threads,
+      gain_threshold = cnv_gain_threshold,
+      loss_threshold = cnv_loss_threshold
     )
 
-    # Generate frequency plot (requires >= 2 samples; skip gracefully for 1)
+    # Generate frequency plot
     if (cnv_frequency_plot) {
-      frequency_plot_path <- tryCatch(
-        generate_cnv_frequency_plot(
-          cnv_results$segments,
-          threshold = cnv_threshold,
-          output_dir = dirs$figures_cnv
-        ),
-        error = function(e) {
-          warning("CNV frequency plot skipped (likely single sample): ", conditionMessage(e))
-          NULL
-        }
+      frequency_plot_path <- generate_cnv_frequency_plot(
+        cnv_results$segments,
+        gain_threshold = cnv_gain_threshold,
+        loss_threshold = cnv_loss_threshold,
+        output_dir = dirs$figures_cnv
       )
       # Add frequency plot path to CNV results
       cnv_results$frequency_plot <- frequency_plot_path
@@ -661,11 +1025,18 @@ run_pipeline <- function(step) {
       load(file.path(dirs$cnv, "cnv_results.RData"))
     }
 
+    if (file.exists(file.path(dirs$reference_projection,
+                              "reference_projection_results.RData"))) {
+      load(file.path(dirs$reference_projection,
+                     "reference_projection_results.RData"))
+    }
+
     # Generate reports
     generate_report(
       qc_results    = if (exists("qc_results"))           qc_results           else NULL,
       dim_reduction = if (exists("dim_reduction_results")) dim_reduction_results else NULL,
       cnv_data      = if (exists("cnv_results"))           cnv_results           else NULL,
+      reference_projection = if (exists("rp_result"))     rp_result            else NULL,
       sample_info   = sample_info,
       output_dirs   = dirs,
       output_dir    = dirs$reports
