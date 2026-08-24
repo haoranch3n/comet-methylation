@@ -358,6 +358,34 @@ plot_dye_bias_qq <- function(basenames, sample_ids, figures_qc_dir) {
 #' @param threads Number of CPU threads to use
 #' @param output_dir Output directory
 #' @return List containing preprocessed data
+#' Promote a single-sample openSesame() result to a 1-column matrix.
+#'
+#' sesame::openSesame() returns a plain named numeric VECTOR when handed exactly
+#' one Basename, and a probes x samples matrix for two or more. Everything
+#' downstream in preprocess_methylation() indexes with `[, ...]` and reads
+#' colnames(), so a one-sample run breaks in two different ways:
+#'
+#'   * beta:        `beta_v2[, match(...)]` errors with
+#'                  "incorrect number of dimensions";
+#'   * detection_p: as.data.frame() of a vector yields a column named after the
+#'                  expression, so match() on Sentrix_ID returns NA and the
+#'                  written detection_p.txt silently becomes all-NA -- which
+#'                  then feeds Pass_QC.
+#'
+#' Reproduce with any platform (not EPICv2-specific):
+#'   openSesame("data/example/9741779008_R03C02", prep="QCDB", func=getBetas)
+#'
+#' This is purely structural -- no value is altered, and a multi-sample run
+#' already has dim() set so it passes straight through.
+#'
+#' @param x         openSesame() result: vector (1 sample) or matrix (>= 2).
+#' @param sample_ids Sentrix IDs from the samplesheet, in samplesheet order.
+#' @return A matrix with probes as rows and samples as columns.
+as_sample_matrix <- function(x, sample_ids) {
+  if (!is.null(dim(x))) return(x)
+  matrix(x, ncol = 1L, dimnames = list(names(x), as.character(sample_ids)[1]))
+}
+
 preprocess_methylation <- function(sample_sheet, array_type = "auto",
                                    normalization = "swan", 
                                    threads = 6,
@@ -419,7 +447,8 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   }else {
     beta_v2 <- sesame::openSesame(sample_sheet$Basename, prep = "QCDB", func = getBetas, BPPARAM=bpparam)
   }
-  beta <- beta_v2[, match(sample_sheet$Sentrix_ID, colnames(beta_v2))]
+  beta_v2 <- as_sample_matrix(beta_v2, sample_sheet$Sentrix_ID)
+  beta <- beta_v2[, match(sample_sheet$Sentrix_ID, colnames(beta_v2)), drop = FALSE]
   message("Number of rows in beta: ", nrow(beta))
 
   ## openSesame(..., func = pOOBAH) doesn't accept collapseToPfx /
@@ -429,6 +458,7 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   ## match beta's per-CpG space for EPICv2.
   detection_p <- sesame::openSesame(sample_sheet$Basename, func = pOOBAH,
                                     return.pval = TRUE, BPPARAM = bpparam)
+  detection_p <- as_sample_matrix(detection_p, sample_sheet$Sentrix_ID)
 
   if (array_type == "EPICv2" &&
       any(grepl("_(BC|TC)\\d+$", utils::head(rownames(detection_p), 200)))) {
@@ -452,15 +482,34 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   }
 
   detection_p_df = as.data.frame(detection_p)
-  detection_p_df <- detection_p_df[, match(sample_sheet$Sentrix_ID, colnames(detection_p_df))]
+  detection_p_df <- detection_p_df[, match(sample_sheet$Sentrix_ID,
+                                           colnames(detection_p_df)), drop = FALSE]
   message("Number of rows in detection_p: ", nrow(detection_p)) 
   
   # Add predicted sex
+  # minfi::getSex() k-means-clusters the X/Y intensity difference ACROSS
+  # samples, so with a single sample min(dd) == max(dd) and kmeans() aborts with
+  # "initial centers are not distinct". Same failure when the Y signal is
+  # constant (e.g. an all-female cohort). Fall back to NA predictions -- sex is
+  # informational here and never gates Pass_QC, so it must not cost the run.
+  #
+  # The fallback keeps xMed/yMed as NA columns so the karyotype step downstream
+  # still finds the fields it reads.
   message("Predicting sex based on methylation patterns...")
   pred_sex <- NULL 
   mset_raw <- preprocessRaw(rgset)
   gset <- mapToGenome(mset_raw)
-  pred_sex <- getSex(gset)
+  pred_sex <- tryCatch(
+    getSex(gset),
+    error = function(e) {
+      warning("getSex failed (likely single sample or non-distinct centers): ",
+              conditionMessage(e), " -- sex prediction set to NA.")
+      n <- ncol(gset)
+      data.frame(predictedSex = rep(NA_character_, n),
+                 xMed = rep(NA_real_, n), yMed = rep(NA_real_, n),
+                 row.names = colnames(gset))
+    }
+  )
 
   # Extract predicted sex values from S4 object. Also keep the X/Y median
   # intensities (xMed/yMed, log2) — they drive minfi's call and, retained here,
@@ -473,6 +522,14 @@ preprocess_methylation <- function(sample_sheet, array_type = "auto",
   } else {
     sample_info$pred_sex <- as.character(pred_sex)
   }
+
+  # Release the raw MethylSet and its genome-mapped copy as soon as the sex call
+  # has been extracted. Both are the size of the full RGChannelSet (~1.1M probes
+  # for EPICv2) and nothing below reads them again -- only rgset is still needed.
+  # Preprocessing is the peak-memory stage of the run, so this is what keeps a
+  # multi-sample cohort inside the worker VM's headroom.
+  rm(mset_raw, gset, pred_sex)
+  gc()
 
   fwrite(detection_p_df, file=file.path(output_dir, "detection_p.txt"), row.names=TRUE, sep="\t")
   m_values = BetaValueToMValue(beta)

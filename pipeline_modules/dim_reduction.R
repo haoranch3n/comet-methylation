@@ -198,6 +198,14 @@ run_umap <- function(beta,
 
   n_neighbors <- min(n_neighbors, nrow(t_beta) - 1L)
 
+  # A single sample leaves no neighbours, and umap() errors rather than
+  # degrading. Skip the way run_tsne() already does for < 4 samples, so a
+  # one-sample run still completes the rest of the pipeline.
+  if (n_neighbors < 1) {
+    warning("Too few unique samples for UMAP (need >= 2). Skipping.")
+    return(list(coords = NULL, sample_info = NULL))
+  }
+
   umap_config             <- umap::umap.defaults
   umap_config$n_neighbors <- n_neighbors
   umap_config$random_state <- 42L
@@ -269,6 +277,13 @@ run_hierarchical_clustering <- function(beta,
   if (!dir.exists(plots_dir))  dir.create(plots_dir,  recursive = TRUE)
 
   beta <- as.matrix(beta)
+
+  # hclust() needs at least two objects to join; with one sample cor() yields a
+  # 1x1 matrix and the call fails. Skip rather than abort the pipeline.
+  if (ncol(beta) < 2) {
+    warning("Too few samples for hierarchical clustering (need >= 2). Skipping.")
+    return(invisible(NULL))
+  }
 
   # Compute distance matrix
   dist_mat <- if (distance %in% c("pearson", "spearman")) {

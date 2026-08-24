@@ -684,8 +684,11 @@ generate_qc_plots <- function(rgset, detP, beta_values, sample_qc,
   
   # 1. Mean detection p-value plot
   message("Generating mean detection p-value plot...")
-  pdf_path <- file.path(output_dir, "mean_detection_pvalue.pdf")
-  pdf(pdf_path, height = 8, width = 12)
+  # Raster for every plot embedded inline in the HTML report: a PDF has to be
+  # handed to the browser's document viewer instead of rendering as an image.
+  # Pixel dimensions + dpi match the sizes the COMET report was built around.
+  png_path <- file.path(output_dir, "mean_detection_pvalue.png")
+  grDevices::png(png_path, height = 600, width = 900, res = 150)
   barplot(sample_qc$Mean_Detection_P, 
           names.arg = sample_qc$Sample_ID, 
           las = 2, 
@@ -699,12 +702,12 @@ generate_qc_plots <- function(rgset, detP, beta_values, sample_qc,
        labels = paste("Threshold (", sample_detection_p_threshold, ")", sep = ""), 
        cex = 0.8)
   dev.off()
-  plots$mean_detection_pvalue <- pdf_path
+  plots$mean_detection_pvalue <- png_path
   
   # 2. Sample density plot
   message("Generating sample density plot...")
-  pdf_path <- file.path(output_dir, "beta_density.pdf")
-  pdf(pdf_path, height = 8, width = 10)
+  png_path <- file.path(output_dir, "beta_density.png")
+  grDevices::png(png_path, height = 600, width = 750, res = 150)
   densityPlot(beta_values, 
               sampGroups = sample_qc$Pass_QC, 
               main = "Beta Value Density Plot",
@@ -714,24 +717,24 @@ generate_qc_plots <- function(rgset, detP, beta_values, sample_qc,
          col = c("black", "red"), 
          lty = 1)
   dev.off()
-  plots$beta_density <- pdf_path
+  plots$beta_density <- png_path
   
   # 3. Bean plot for beta distribution
   message("Generating bean plot...")
-  pdf_path <- file.path(output_dir, "beta_bean_plot.pdf")
-  pdf(pdf_path, height = 8, width = 10)
+  png_path <- file.path(output_dir, "beta_bean_plot.png")
+  grDevices::png(png_path, height = 600, width = 750, res = 150)
   densityBeanPlot(beta_values, 
                   sampGroups = sample_qc$Pass_QC,
                   main = "Beta Value Distribution")
   dev.off()
-  plots$beta_bean <- pdf_path
+  plots$beta_bean <- png_path
   
  
   # 4. MDS plot if we have more than 3 samples
   if (ncol(beta_values) > 3) {
     message("Generating MDS plot...")
-    pdf_path <- file.path(output_dir, "mds_plot.pdf")
-    pdf(pdf_path, height = 8, width = 10)
+    png_path <- file.path(output_dir, "mds_plot.png")
+    grDevices::png(png_path, height = 900, width = 750, res = 150)
     
     # Use tryCatch in case MDS calculation fails
     tryCatch({
@@ -759,7 +762,7 @@ generate_qc_plots <- function(rgset, detP, beta_values, sample_qc,
     })
     
     dev.off()
-    plots$mds <- pdf_path
+    plots$mds <- png_path
   }
   
   # Create interactive plots using plotly if requested

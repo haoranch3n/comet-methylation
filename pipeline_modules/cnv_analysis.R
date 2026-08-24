@@ -546,8 +546,12 @@ process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_d
   # `cols` is a 5-stop palette interpolated low→high (loss→neutral→gain):
   # dark teal → light teal → neutral grey → light brown → dark brown.
   # Matches the CNV heatmap's teal/brown diverging scheme.
-  pdf_file <- file.path(plots_dir, paste0(clean_sample_id, "_cnv_profile.pdf"))
-  pdf(pdf_file, width = 10, height = 5)
+  # Raster, not vector. This figure is embedded in the HTML report and in the
+  # COMET web app's results panel as a plain <img>; a PDF has to be handed to
+  # the browser's PDF viewer instead, which presents badly inline. 12x6in at
+  # 300 dpi (3600x1800 px) is the size the web app was built around.
+  plot_file <- file.path(plots_dir, paste0(clean_sample_id, "_cnv_profile.png"))
+  grDevices::png(plot_file, width = 12, height = 6, units = "in", res = 300)
   # CNV.genomeplot draws the panel (with xlab=NA, ylab=NA) and manages par
   # itself — touching par() around the call disrupts its internal title /
   # chromosome / gene / y-axis drawing. So leave par alone and only add the
@@ -601,7 +605,7 @@ process_conumee_sample <- function(rgset, sample_id, ref_controls, anno, plots_d
     segments = segments_df,
     bins = cnv_bin,
     segments_file = seg_file,
-    plot_file = pdf_file
+    plot_file = plot_file
   )
 }
 
@@ -744,9 +748,10 @@ generate_cnv_frequency_plot <- function(segments,
     return(NULL)
   }
   
-  # Generate plot
-  pdf_path <- file.path(output_dir, "cnv_frequency_plot.pdf")
-  pdf(pdf_path, width = 12, height = 5)
+  # Generate plot. Raster for the same reason as the per-sample profile: it is
+  # embedded inline in the HTML report rather than opened as a document.
+  png_path <- file.path(output_dir, "cnv_frequency_plot.png")
+  grDevices::png(png_path, width = 12, height = 5, units = "in", res = 200)
   # Margins for the axis titles + tick labels freqplot draws (left: y-scale +
   # "% of Gain or Loss"; bottom: chromosome numbers + "Chromosome").
   par(mar = c(4, 5, 2, 2) + 0.1)
@@ -761,7 +766,7 @@ generate_cnv_frequency_plot <- function(segments,
   
   dev.off()
   
-  return(pdf_path)
+  return(png_path)
 }
 
 #' Source freqplot functions
@@ -937,13 +942,16 @@ source_freqplot_functions <- function() {
     }
     
     # Remove rows with all NAs
+    # drop = FALSE keeps X 2-D when nsamp == 1. Without it a single-sample
+    # cohort collapses X to a vector here, and the rowSums()/X[-1, ] arithmetic
+    # below then fails or silently computes the wrong thing.
     all.na <- (rowSums(is.na(X)) == nsamp)
-    X <- X[!all.na, ]
+    X <- X[!all.na, , drop = FALSE]
     uniq.ints <- uniq.ints[!all.na, ]
     
     # Combine identical adjacent rows
     x.nints <- nrow(X)
-    x.chng <- rowSums(abs(X[-1, ] - X[-x.nints, ])) > 0
+    x.chng <- rowSums(abs(X[-1, , drop = FALSE] - X[-x.nints, , drop = FALSE])) > 0
     x.chng[is.na(x.chng)] <- TRUE
     chr.chng <- (uniq.ints[-1, 1] != uniq.ints[-x.nints, 1])
     new.row <- which(chr.chng | x.chng)
@@ -952,7 +960,7 @@ source_freqplot_functions <- function() {
     new.start <- uniq.ints[c(1, new.row + 1), 2]
     new.end <- uniq.ints[c(new.row, x.nints), 3]
     
-    X <- X[c(1, new.row + 1), ]
+    X <- X[c(1, new.row + 1), , drop = FALSE]
     new.ints <- cbind.data.frame(
       chrom = new.chr,
       loc.start = new.start,
