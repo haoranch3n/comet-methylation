@@ -844,9 +844,17 @@ run_pipeline <- function(step) {
     # such as "../reference" resolves to the repo-root reference/ folder.
     rp_reference_dir <- normalizePath(rp_reference_dir, mustWork = FALSE)
 
+    # rp_status travels to generate_report() so the report can distinguish a
+    # deliberate skip from a failure. The COMET web upload sets
+    # reference_projection$enabled = FALSE on purpose (the platform runs its own
+    # top-K projection after the pipeline exits), and reporting that as a
+    # missing result made every web job look half-finished.
+    rp_status <- NULL
     if (!rp_enabled) {
+      rp_status <- "disabled"
       log_message("Reference projection disabled in config — skipping.", log_file)
     } else if (!dir.exists(rp_reference_dir)) {
+      rp_status <- "no_reference_dir"
       log_message(paste("Reference data directory not found — skipping projection:",
                         rp_reference_dir), log_file)
     } else {
@@ -870,6 +878,7 @@ run_pipeline <- function(step) {
           NULL
         }
       )
+      if (is.null(rp_result)) rp_status <- "failed"
       if (!is.null(rp_result)) {
         save(rp_result,
              file = file.path(dirs$reference_projection,
@@ -1051,6 +1060,8 @@ run_pipeline <- function(step) {
       dim_reduction = if (exists("dim_reduction_results")) dim_reduction_results else NULL,
       cnv_data      = if (exists("cnv_results"))           cnv_results           else NULL,
       reference_projection = if (exists("rp_result"))     rp_result            else NULL,
+      reference_projection_status =
+        if (exists("rp_status"))                          rp_status            else NULL,
       sample_info   = sample_info,
       output_dirs   = dirs,
       output_dir    = dirs$reports

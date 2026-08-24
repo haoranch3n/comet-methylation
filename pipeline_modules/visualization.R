@@ -7,6 +7,9 @@
 #' @param cnv_data CNV analysis results
 #' @param reference_projection Reference-projection results (the rp_result
 #'   list from run_reference_projection: dataset, projected, class_hints, ...)
+#' @param reference_projection_status Why `reference_projection` is NULL, when
+#'   it is: "disabled", "no_reference_dir" or "failed". Lets the report say
+#'   which, instead of reporting a deliberate skip as a missing result.
 #' @param sample_info Sample information data frame
 #' @param output_dirs Named list of module output directories (from setup_directories())
 #' @param output_dir Output directory for reports
@@ -15,6 +18,7 @@ generate_report <- function(qc_results = NULL,
                           dim_reduction = NULL,
                           cnv_data = NULL,
                           reference_projection = NULL,
+                          reference_projection_status = NULL,
                           sample_info = NULL,
                           output_dirs = NULL,
                           output_dir = ".") {
@@ -65,6 +69,10 @@ generate_report <- function(qc_results = NULL,
       dim_reduction        = dim_reduction,
       cnv_data             = cnv_data,
       reference_projection = reference_projection,
+      # Why the projection section is empty, when it is: "disabled",
+      # "no_reference_dir", "failed" or NULL. Without it the report cannot tell
+      # a deliberate skip from a failure.
+      reference_projection_status = reference_projection_status,
       sample_info          = sample_info,
       output_dirs          = output_dirs,
       generation_time      = Sys.time()
@@ -134,8 +142,15 @@ output:
   # Create the R Markdown content body
   rmd_body <- '
 ```{r setup, include=FALSE}
+# results = "asis" is load-bearing, not cosmetic. Every explanatory line in
+# this report is produced by cat()-ing markdown, and without it knitr wraps
+# that output in a verbatim block: the report then renders as console text --
+# "## **1 samples passed QC**", "## *Plot not available*", and an unclickable
+# "## [Interactive density plot](interactive_density_plot.html)". Chunks that
+# genuinely want verbatim output (session info) set results = "markup" on
+# themselves.
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
-                      fig.width = 10, fig.height = 7)
+                      fig.width = 10, fig.height = 7, results = "asis")
 library(ggplot2)
 library(DT)
 library(knitr)
@@ -208,14 +223,74 @@ resolve_plot_path <- function(stored_path, module_dir = NULL) {
   return(NULL)
 }
 
-# Convenience wrapper: include a static plot (PDF or PNG) or show a message
-show_plot <- function(path, caption = "") {
-  path <- resolve_plot_path(path)
-  if (!is.null(path)) {
-    knitr::include_graphics(path)
-  } else {
-    cat("*Plot not available*\n\n")
+# Emit an italic note. paste0 rather than sprintf so a message that happens to
+# contain a percent sign cannot abort the render.
+emit_note <- function(...) cat("*", paste0(...), "*", "\n\n", sep = "")
+
+# Emit a figure as markdown instead of via knitr::include_graphics().
+# include_graphics() returns a knit_asis object that knitr renders only where
+# it is a top-level visible value; print()ing one inside a for loop -- which is
+# what the per-sample CNV section did -- writes the raw path and its attributes
+# into the report instead of the image. cat()ing markdown works in both
+# positions. Returns TRUE when a figure was emitted.
+emit_plot <- function(path, module_dir = NULL, missing_note = "Plot not available") {
+  p <- resolve_plot_path(path, module_dir)
+  if (is.null(p)) {
+    emit_note(missing_note)
+    return(invisible(FALSE))
   }
+  # A PDF cannot be shown inline in an HTML report, so link it rather than
+  # emitting an img tag that renders as a broken image.
+  if (identical(tolower(tools::file_ext(p)), "pdf")) {
+    cat("[Open the figure (PDF)](", p, ")", "\n\n", sep = "")
+  } else {
+    cat("![](", p, ")", "\n\n", sep = "")
+  }
+  invisible(TRUE)
+}
+
+# Rewrite an absolute path as one relative to the report itself. The links
+# below would otherwise expose the server-side results path
+# (/mnt/blob/.../results/j_<uuid>/...) inside a document users download and
+# forward, and that path means nothing on their machine anyway. knit_root_dir
+# is normally the reports directory, but anchor on the recorded reports
+# directory when there is one so re-rendering an old report from somewhere else
+# still yields ../figures/qc/... instead of a chain of parent hops.
+rel_to_report <- function(p) {
+  if (is.null(p) || !nzchar(p)) return(p)
+  ap <- tryCatch(normalizePath(p, winslash = "/", mustWork = FALSE),
+                 error = function(e) p)
+  anchor <- report_data$output_dirs$reports
+  if (is.null(anchor) || !nzchar(anchor)) anchor <- getwd()
+  wd <- tryCatch(normalizePath(anchor, winslash = "/", mustWork = FALSE),
+                 error = function(e) NULL)
+  if (is.null(wd)) return(ap)
+  a <- strsplit(ap, "/", fixed = TRUE)[[1]]
+  b <- strsplit(wd, "/", fixed = TRUE)[[1]]
+  k <- 0L
+  while (k < min(length(a), length(b)) && identical(a[k + 1L], b[k + 1L])) {
+    k <- k + 1L
+  }
+  if (k == 0L) return(ap)
+  paste(c(rep("..", length(b) - k), a[-seq_len(k)]), collapse = "/")
+}
+
+# Drop columns that hold no value for any sample. Several are NA by
+# construction on a single-sample run -- minfi getSex() k-means-clusters X/Y
+# intensity ACROSS samples and cannot run on one, and the SNP fingerprint has
+# nothing to match against -- and a table of NA columns reads as a broken
+# report rather than as a measurement that does not apply. Returns the kept
+# frame plus the dropped names, so the report can say what it removed.
+drop_empty_cols <- function(df) {
+  if (is.null(df) || !is.data.frame(df) || ncol(df) == 0) {
+    return(list(df = df, dropped = character(0)))
+  }
+  keep <- vapply(df, function(x) {
+    v <- as.character(x)
+    any(!is.na(v) & nzchar(trimws(v)))
+  }, logical(1))
+  if (!any(keep)) return(list(df = df, dropped = character(0)))
+  list(df = df[, keep, drop = FALSE], dropped = colnames(df)[!keep])
 }
 
 # Convenience: make a datatable or print a message
@@ -226,6 +301,29 @@ show_table <- function(df, caption = "", ...) {
   } else {
     cat("*Table not available*\n\n")
   }
+}
+
+# Sample count the analysis steps actually saw: QC-passed samples when QC ran,
+# otherwise the samplesheet size. Used below to explain why a step was skipped
+# instead of leaving the reader with a bare "not available".
+n_pass_qc <- if (!is.null(report_data$qc_results)) {
+  length(report_data$qc_results$passed_samples)
+} else NA_integer_
+n_sheet <- if (!is.null(report_data$sample_info)) nrow(report_data$sample_info) else NA_integer_
+n_used  <- if (!is.na(n_pass_qc) && n_pass_qc > 0L) n_pass_qc else n_sheet
+
+# Explain a step that cannot run at this sample count. The minimums are
+# properties of the algorithms, not policy: t-SNE needs perplexity >= 1 and
+# caps it at (n - 1) / 3, so it needs 4; umap() requires n_neighbors > 1, so 3;
+# plot.hclust() cannot draw a single merge, so 3; and the MDS plot is only
+# drawn above 3.
+emit_too_few <- function(what, need) {
+  have <- if (is.na(n_used)) "fewer" else as.character(n_used)
+  emit_note(what, " compares samples against each other, so it needs at least ",
+            need, " and this run has ", have, ". It was skipped rather than ",
+            "failing, and no per-sample result above is affected. Your sample ",
+            "is instead placed against the full COMET reference cohort in the ",
+            "viewer, which is what this section would otherwise approximate.")
 }
 
 # Pull directories from report_data
@@ -239,7 +337,15 @@ This report summarises the results of methylation array analysis performed using
 ## Sample Information
 
 ```{r sample_info}
-show_table(report_data$sample_info, caption = "Sample Information")
+si_clean <- drop_empty_cols(report_data$sample_info)
+show_table(si_clean$df, caption = "Sample Information")
+if (length(si_clean$dropped) > 0) {
+  emit_note("Columns with no value for any sample were removed here: ",
+            paste(si_clean$dropped, collapse = ", "),
+            ". On a single-sample run minfi cannot call sex, because its ",
+            "estimator clusters X/Y intensity across samples -- read the ",
+            "sesame sex call and karyotype in the QC table below instead.")
+}
 ```
 
 # Quality Control {.tabset}
@@ -252,7 +358,15 @@ has_qc <- !is.null(qc)
 ```{r qc_summary, eval=has_qc}
 n_pass <- length(qc$passed_samples)
 n_fail <- length(qc$failed_samples)
-cat(sprintf("**%d samples passed QC** | **%d samples failed QC**\n\n", n_pass, n_fail))
+cat(sprintf("**%d sample(s) passed QC** | **%d sample(s) failed QC**\n\n",
+            n_pass, n_fail))
+if (n_fail > 0) {
+  cat("Failed: ", paste(qc$failed_samples, collapse = ", "), "\n\n", sep = "")
+}
+if (length(qc$gct_failed_samples) > 0) {
+  cat("Dropped by the GCT bisulfite-conversion gate: ",
+      paste(qc$gct_failed_samples, collapse = ", "), "\n\n", sep = "")
+}
 ```
 
 ## QC Metrics Table
@@ -268,33 +382,35 @@ cat("No QC results available.")
 ## Mean Detection P-value
 
 ```{r qc_detp, eval=has_qc}
-p <- resolve_plot_path(qc$plots$mean_detection_pvalue,
-                       if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+emit_plot(qc$plots$mean_detection_pvalue, if (!is.null(odirs)) odirs$figures_qc else NULL,
+          missing_note = "The detection p-value plot was not produced by this run")
 ```
 
 ## Beta Density
 
 ```{r qc_density, eval=has_qc}
-p <- resolve_plot_path(qc$plots$beta_density,
-                       if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+emit_plot(qc$plots$beta_density, if (!is.null(odirs)) odirs$figures_qc else NULL,
+          missing_note = "The beta density plot was not produced by this run")
 ```
 
 ## Beta Bean Plot
 
 ```{r qc_bean, eval=has_qc}
-p <- resolve_plot_path(qc$plots$beta_bean,
-                       if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+emit_plot(qc$plots$beta_bean, if (!is.null(odirs)) odirs$figures_qc else NULL,
+          missing_note = "The beta bean plot was not produced by this run")
 ```
 
 ## MDS Plot
 
 ```{r qc_mds, eval=has_qc}
-p <- resolve_plot_path(qc$plots$mds,
-                       if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Plot not available*\n\n")
+# The MDS plot is only drawn above 3 samples (qc.R), so on the single-sample
+# uploads this pipeline mostly serves its absence is the norm. Say why.
+if (is.null(qc$plots$mds) && !is.na(n_used) && n_used < 4) {
+  emit_too_few("An MDS plot", 4)
+} else {
+  emit_plot(qc$plots$mds, if (!is.null(odirs)) odirs$figures_qc else NULL,
+            missing_note = "The MDS plot was not produced by this run")
+}
 ```
 
 ## Interactive Plots
@@ -304,9 +420,28 @@ idens <- resolve_plot_path(qc$plots$interactive_density,
                            if (!is.null(odirs)) odirs$figures_qc else NULL)
 imds  <- resolve_plot_path(qc$plots$interactive_mds,
                            if (!is.null(odirs)) odirs$figures_qc else NULL)
-if (!is.null(idens)) cat(sprintf("[Interactive density plot](%s)\n\n", basename(idens)))
-if (!is.null(imds))  cat(sprintf("[Interactive MDS plot](%s)\n\n",     basename(imds)))
-if (is.null(idens) && is.null(imds)) cat("*Interactive plots not available*\n\n")
+# Link the resolved path, not basename(): these widgets are written to
+# figures/qc/ while the report lands in reports/, so a bare filename pointed at
+# a sibling that does not exist. Even correct, the link only resolves when the
+# report is opened inside the results folder -- the HTML itself is
+# self-contained and often travels alone -- so say so.
+if (!is.null(idens)) {
+  cat("[Interactive density plot](", rel_to_report(idens), ")", "\n\n", sep = "")
+}
+if (!is.null(imds)) {
+  cat("[Interactive MDS plot](", rel_to_report(imds), ")", "\n\n", sep = "")
+}
+if (is.null(idens) && is.null(imds)) {
+  if (!is.na(n_used) && n_used < 4) {
+    emit_too_few("An interactive MDS plot", 4)
+  } else {
+    emit_note("Interactive plots were not produced by this run")
+  }
+} else {
+  emit_note("These open the standalone widget files stored alongside this ",
+            "report under figures/qc/, so they need the whole results folder ",
+            "rather than this HTML file on its own.")
+}
 ```
 
 # Dimensionality Reduction {.tabset}
@@ -319,7 +454,7 @@ dr_dir <- if (!is.null(odirs)) odirs$figures_dim_reduction else NULL
 
 ## t-SNE
 
-```{r tsne_results, eval=has_dr && !is.null(dr$tsne)}
+```{r tsne_results, eval=has_dr && !is.null(dr$tsne$coords)}
 tsne <- dr$tsne
 # coords field (actual name from dim_reduction.R)
 coords_df <- tsne$coords
@@ -327,9 +462,8 @@ if (!is.null(coords_df) && is.data.frame(coords_df)) {
   show_table(coords_df, caption = "t-SNE Coordinates")
 }
 
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "tsne_plot.png"),
-                       dr_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*t-SNE plot not available*\n\n")
+emit_plot(file.path(if (!is.null(dr_dir)) dr_dir else ".", "tsne_plot.png"),
+          dr_dir, missing_note = "The t-SNE plot was not produced by this run")
 
 if (length(tsne$duplicates) > 0) {
   cat("\n**Duplicate samples removed before t-SNE:**",
@@ -337,26 +471,33 @@ if (length(tsne$duplicates) > 0) {
 }
 ```
 
-```{r tsne_unavailable, eval=!has_dr || is.null(dr$tsne)}
-cat("No t-SNE results available.")
+```{r tsne_unavailable, eval=!has_dr || is.null(dr$tsne$coords)}
+if (!is.na(n_used) && n_used < 4) {
+  emit_too_few("t-SNE", 4)
+} else {
+  emit_note("No t-SNE results are available for this run.")
+}
 ```
 
 ## UMAP
 
-```{r umap_results, eval=has_dr && !is.null(dr$umap)}
+```{r umap_results, eval=has_dr && !is.null(dr$umap$coords)}
 umap_res <- dr$umap
 coords_df <- umap_res$coords
 if (!is.null(coords_df) && is.data.frame(coords_df)) {
   show_table(coords_df, caption = "UMAP Coordinates")
 }
 
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "umap_plot.png"),
-                       dr_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*UMAP plot not available*\n\n")
+emit_plot(file.path(if (!is.null(dr_dir)) dr_dir else ".", "umap_plot.png"),
+          dr_dir, missing_note = "The UMAP plot was not produced by this run")
 ```
 
-```{r umap_unavailable, eval=!has_dr || is.null(dr$umap)}
-cat("No UMAP results available.")
+```{r umap_unavailable, eval=!has_dr || is.null(dr$umap$coords)}
+if (!is.na(n_used) && n_used < 3) {
+  emit_too_few("UMAP", 3)
+} else {
+  emit_note("No UMAP results are available for this run.")
+}
 ```
 
 ## Hierarchical Clustering
@@ -366,13 +507,22 @@ hcl <- dr$hclust
 cat(sprintf("**Method:** %s | **Distance:** %s\n\n",
             hcl$method, hcl$distance))
 
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "hclust_dendrogram.png"),
-                       dr_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*Dendrogram not available*\n\n")
+# hclust() joins two samples fine, but plot.hclust() cannot draw a single
+# merge, so a two-sample run has results and no figure.
+if (!is.na(n_used) && n_used < 3) {
+  emit_too_few("A dendrogram", 3)
+} else {
+  emit_plot(file.path(if (!is.null(dr_dir)) dr_dir else ".", "hclust_dendrogram.png"),
+            dr_dir, missing_note = "The dendrogram was not produced by this run")
+}
 ```
 
 ```{r hclust_unavailable, eval=!has_dr || is.null(dr$hclust)}
-cat("No hierarchical clustering results available.")
+if (!is.na(n_used) && n_used < 2) {
+  emit_too_few("Hierarchical clustering", 2)
+} else {
+  emit_note("No hierarchical clustering results are available for this run.")
+}
 ```
 
 # Reference Projection {.tabset}
@@ -418,7 +568,29 @@ show_table(tbl, caption = "Per-sample nearest reference tumour class")
 ```
 
 ```{r refproj_unavailable, eval=!has_rp}
-cat("No reference projection results available.")
+# Distinguish "switched off for this run" from "tried and failed". The COMET
+# web upload deliberately disables this step -- the platform runs its own
+# top-K projection against the reference snapshot after the pipeline exits and
+# renders it in the viewer -- so the previous flat "No reference projection
+# results available." was read as a broken section on every web job.
+rp_status <- report_data$reference_projection_status
+if (identical(rp_status, "disabled")) {
+  emit_note("Reference projection is turned off for this run. On the COMET ",
+            "website that is deliberate: the platform projects your sample ",
+            "onto the reference cohort itself once the pipeline finishes and ",
+            "shows it as a star in the viewer, using the same embedding the ",
+            "viewer draws. Nothing failed, and nothing is missing from the ",
+            "results folder.")
+} else if (identical(rp_status, "no_reference_dir")) {
+  emit_note("Reference projection was skipped because the reference data ",
+            "directory was not present for this run.")
+} else if (identical(rp_status, "failed")) {
+  emit_note("Reference projection was attempted but did not complete; see ",
+            "pipeline_log.txt for the reason. Every other section of this ",
+            "report is unaffected.")
+} else {
+  emit_note("No reference projection results are available for this run.")
+}
 ```
 
 ## Projection Plot
@@ -509,35 +681,41 @@ cat("No CNV analysis results available.")
 ## Frequency Plot
 
 ```{r cnv_freq, eval=has_cnv}
-p <- resolve_plot_path(cnv_data$frequency_plot, cnv_dir)
-if (!is.null(p)) knitr::include_graphics(p) else cat("*CNV frequency plot not available*\n\n")
+emit_plot(cnv_data$frequency_plot, cnv_dir,
+          missing_note = "The CNV frequency plot was not produced by this run")
 ```
 
 ## Individual Sample Profiles
 
 ```{r cnv_samples, eval=has_cnv && !is.null(cnv_data$sample_results)}
+# emit_plot() rather than print(include_graphics()): inside this loop the
+# latter printed the path and its knit_asis attributes as text, so the
+# per-sample CNV profiles -- one PNG per sample, and the most useful CNV
+# output in the report -- never appeared as images at all.
 plots_found <- 0L
 for (res in cnv_data$sample_results) {
   if (!is.null(res$plot_file)) {
-    p <- resolve_plot_path(res$plot_file, cnv_dir)
-    if (!is.null(p)) {
-      cat("### Sample:", res$sample_id, "\n\n")
-      print(knitr::include_graphics(p))
-      cat("\n\n")
+    cat("### Sample: ", res$sample_id, "\n\n", sep = "")
+    if (emit_plot(res$plot_file, cnv_dir,
+                  missing_note = "The CNV profile figure for this sample was not found")) {
       plots_found <- plots_found + 1L
     }
   }
 }
 if (plots_found == 0L) {
-  cat(sprintf("*No individual CNV plots found (expected %d samples)*\n\n",
-              length(cnv_data$sample_results)))
+  emit_note("No individual CNV profile figures were found (expected ",
+            length(cnv_data$sample_results), ").")
 }
 ```
 
 # Session Information
 
-```{r session_info}
-cat("Report generated on:", format(report_data$generation_time, "%Y-%m-%d %H:%M:%S"), "\n\n")
+```{r session_info_time}
+cat("Report generated on: ",
+    format(report_data$generation_time, "%Y-%m-%d %H:%M:%S"), "\n\n", sep = "")
+```
+
+```{r session_info, results="markup"}
 sessionInfo()
 ```
 '
