@@ -146,8 +146,15 @@ run_tsne <- function(beta,
     p <- p + aes(colour = Sample_Group)
   }
 
-  ggsave(file.path(plots_dir, "tsne_plot.pdf"), p,
-         width = 7, height = 6)
+  # PNG, not PDF. The HTML report embeds figures with knitr::include_graphics(),
+  # and pandoc turns a PDF into `<embed src="data:application/pdf;base64,...">`
+  # with no width or height -- so it renders at the CSS default of roughly
+  # 300x150 px, a tiny scrollable PDF frame, and is blocked outright by any
+  # Content-Security-Policy carrying `object-src 'none'`. A PNG becomes a plain
+  # `<img>` that scales with the page. The QC and CNV figures were converted for
+  # the same reason; these three were the remainder.
+  ggsave(file.path(plots_dir, "tsne_plot.png"), p,
+         width = 7, height = 6, dpi = 200)
 
   invisible(tsne_results)
 }
@@ -198,11 +205,22 @@ run_umap <- function(beta,
 
   n_neighbors <- min(n_neighbors, nrow(t_beta) - 1L)
 
-  # A single sample leaves no neighbours, and umap() errors rather than
-  # degrading. Skip the way run_tsne() already does for < 4 samples, so a
-  # one-sample run still completes the rest of the pipeline.
-  if (n_neighbors < 1) {
-    warning("Too few unique samples for UMAP (need >= 2). Skipping.")
+  # umap() requires n_neighbors > 1 -- strictly greater, not >= 1 -- so the
+  # smallest cohort it can embed is three samples. Skip below that instead of
+  # letting umap() abort the run, the way run_tsne() already skips under four.
+  #
+  # The old guard was `n_neighbors < 1`, which covered a single sample
+  # (n_neighbors 0) but let exactly two through with n_neighbors 1, and umap()
+  # then stopped with "number of neighbors must be greater than 1" -- taking the
+  # whole pipeline down at step 3 after preprocessing and QC had succeeded.
+  # Two-sample uploads hit this directly; larger ones reach it whenever the QC
+  # gate in qc.R drops enough samples, which is how it showed up on the
+  # four-sample EPICv2 example (two samples failed the GCT bisulfite-conversion
+  # check, leaving two).
+  if (n_neighbors < 2) {
+    warning(sprintf(
+      "Too few unique samples for UMAP (have %d, need >= 3). Skipping.",
+      nrow(t_beta)))
     return(list(coords = NULL, sample_info = NULL))
   }
 
@@ -243,8 +261,8 @@ run_umap <- function(beta,
     p <- p + aes(colour = Sample_Group)
   }
 
-  ggsave(file.path(plots_dir, "umap_plot.pdf"), p,
-         width = 7, height = 6)
+  ggsave(file.path(plots_dir, "umap_plot.png"), p,
+         width = 7, height = 6, dpi = 200)
 
   invisible(umap_results)
 }
@@ -310,9 +328,29 @@ run_hierarchical_clustering <- function(beta,
   save(hclust_results,
        file = file.path(output_dir, "hclust_results.RData"))
 
+  # The clustering above is valid for two samples -- one merge, one height --
+  # but base R cannot DRAW a two-leaf dendrogram: plot.hclust() hands a single
+  # merge to graphics:::plotHclust(), which rejects it with "invalid dendrogram
+  # input". Verified on R 4.4.3: n=2 fails, n=3 and above plot fine. So the
+  # result is always saved and only the figure is conditional; the report
+  # resolves a missing plot to "*Plot not available*" on its own.
+  #
+  # Two-sample cohorts are not hypothetical here: a user can upload exactly
+  # two, and a larger run lands on two whenever the GCT bisulfite-conversion
+  # gate in qc.R drops the rest (which is what the four-sample EPICv2 example
+  # does). Before this, the whole pipeline aborted at step 3 after
+  # preprocessing, QC, filtering and t-SNE/UMAP had all succeeded.
+  if (ncol(beta) < 3) {
+    warning(sprintf(
+      paste0("Dendrogram needs >= 3 samples to plot (have %d); saved ",
+             "hclust_results.RData without the figure."), ncol(beta)))
+    return(invisible(hclust_results))
+  }
+
   # Plot dendrogram
-  pdf(file.path(plots_dir, "hclust_dendrogram.pdf"),
-      width = max(10, ncol(beta) * 0.3), height = 8)
+  grDevices::png(file.path(plots_dir, "hclust_dendrogram.png"),
+                 width = max(10, ncol(beta) * 0.3), height = 8,
+                 units = "in", res = 150)
   par(mar = c(10, 4, 4, 2))
   plot(hc,
        main  = sprintf("Hierarchical Clustering (%s / %s)", method, distance),

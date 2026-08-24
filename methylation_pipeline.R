@@ -527,6 +527,20 @@ run_pipeline <- function(step) {
       passed_samples <- qc_results$passed_samples
       n_removed <- length(qc_results$failed_samples)
 
+      # Every sample failing is a real outcome (one badly converted sample in a
+      # single-sample upload does it), and without this the filter below leaves
+      # a zero-column beta matrix that only breaks several steps later with an
+      # unrelated-looking subscript error. Stop here with the reason instead.
+      if (length(passed_samples) == 0) {
+        stop(sprintf(
+          paste0("All %d sample(s) failed QC, so there is nothing left to ",
+                 "analyse. Failed: %s. See %s for the per-sample metrics."),
+          n_removed,
+          paste(qc_results$failed_samples, collapse = ", "),
+          file.path(dirs$qc, "sample_qc_report.csv")),
+          call. = FALSE)
+      }
+
       if (n_removed > 0) {
         log_message(sprintf("Removing %d failed sample(s) from all data objects: %s",
                             n_removed,

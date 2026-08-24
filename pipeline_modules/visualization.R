@@ -157,29 +157,51 @@ resolve_plot_path <- function(stored_path, module_dir = NULL) {
 
   fname <- basename(stored_path)
 
-  # 2. Look for the file in the supplied module directory
-  if (!is.null(module_dir) && nzchar(module_dir)) {
-    candidate <- file.path(module_dir, fname)
-    if (file.exists(candidate)) return(candidate)
-    # Also try one level deeper (e.g. qc/plots/)
-    candidate2 <- file.path(module_dir, "plots", fname)
-    if (file.exists(candidate2)) return(candidate2)
+  # A run made before the PDF -> PNG conversion has the same figure under the
+  # other extension. Try the sibling so re-rendering a report over an older
+  # output directory still finds its plots instead of printing
+  # "*Plot not available*". Mirrors user_upload_cnv_plot_path() in the Shiny
+  # layer, which resolves the CNV figure the same way.
+  # NOTE: everything from here to the end of rmd_body lives inside a
+  # SINGLE-QUOTED R string, so R resolves escape sequences once before the text
+  # is ever written to the Rmd. A regex written here with a doubled backslash
+  # arrives in the Rmd with a single one, and the setup chunk then dies with
+  # "unrecognized escape in character string" -- which is why this comparison
+  # uses tools::file_ext() instead of a regex. Keep this region free of
+  # backslashes; if you ever need one, it has to be quadrupled.
+  .siblings <- function(nm) {
+    ext <- tolower(tools::file_ext(nm))
+    stem <- tools::file_path_sans_ext(nm)
+    if (ext == "png") c(nm, paste0(stem, ".pdf"))
+    else if (ext == "pdf") c(nm, paste0(stem, ".png"))
+    else nm
   }
 
-  # 3. Look relative to the reports directory (where we are rendering)
-  for (rel in c(
-      file.path("..", "figures", "qc",            fname),
-      file.path("..", "figures", "dim_reduction", fname),
-      file.path("..", "figures", "cnv",           fname),
-      file.path("..", "qc", "plots",              fname),
-      file.path("..", "qc",                       fname),
-      file.path("..", "dimensionality_reduction", fname),
-      file.path("..", "cnv",                      fname),
-      file.path("..", "cnv", "plots",             fname),
-      file.path("..", "reference_projection",     fname),
-      fname
-  )) {
-    if (file.exists(rel)) return(rel)
+  # 2/3. Search every known location, preferring the requested extension over
+  # its sibling at each one -- the stored .png first, the legacy .pdf only if no
+  # .png exists anywhere.
+  for (nm in .siblings(fname)) {
+    if (!is.null(module_dir) && nzchar(module_dir)) {
+      candidate <- file.path(module_dir, nm)
+      if (file.exists(candidate)) return(candidate)
+      # Also try one level deeper (e.g. qc/plots/)
+      candidate2 <- file.path(module_dir, "plots", nm)
+      if (file.exists(candidate2)) return(candidate2)
+    }
+    for (rel in c(
+        file.path("..", "figures", "qc",            nm),
+        file.path("..", "figures", "dim_reduction", nm),
+        file.path("..", "figures", "cnv",           nm),
+        file.path("..", "qc", "plots",              nm),
+        file.path("..", "qc",                       nm),
+        file.path("..", "dimensionality_reduction", nm),
+        file.path("..", "cnv",                      nm),
+        file.path("..", "cnv", "plots",             nm),
+        file.path("..", "reference_projection",     nm),
+        nm
+    )) {
+      if (file.exists(rel)) return(rel)
+    }
   }
 
   # 4. Return NULL so callers can show "not available" gracefully
@@ -305,7 +327,7 @@ if (!is.null(coords_df) && is.data.frame(coords_df)) {
   show_table(coords_df, caption = "t-SNE Coordinates")
 }
 
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "tsne_plot.pdf"),
+p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "tsne_plot.png"),
                        dr_dir)
 if (!is.null(p)) knitr::include_graphics(p) else cat("*t-SNE plot not available*\n\n")
 
@@ -328,7 +350,7 @@ if (!is.null(coords_df) && is.data.frame(coords_df)) {
   show_table(coords_df, caption = "UMAP Coordinates")
 }
 
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "umap_plot.pdf"),
+p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "umap_plot.png"),
                        dr_dir)
 if (!is.null(p)) knitr::include_graphics(p) else cat("*UMAP plot not available*\n\n")
 ```
@@ -344,7 +366,7 @@ hcl <- dr$hclust
 cat(sprintf("**Method:** %s | **Distance:** %s\n\n",
             hcl$method, hcl$distance))
 
-p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "hclust_dendrogram.pdf"),
+p <- resolve_plot_path(file.path(if (!is.null(dr_dir)) dr_dir else ".", "hclust_dendrogram.png"),
                        dr_dir)
 if (!is.null(p)) knitr::include_graphics(p) else cat("*Dendrogram not available*\n\n")
 ```
